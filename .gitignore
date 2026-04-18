@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# VulnClaw runtime
+.vulnclaw/
+.workbuddy/
+sessions/
+
+# Test / coverage
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Temp files
+*.tmp
+*.bak
+_test_output*.txt
+_test_report_raw.txt

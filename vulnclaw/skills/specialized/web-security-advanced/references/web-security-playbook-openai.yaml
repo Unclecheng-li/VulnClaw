@@ -1,0 +1,7 @@
+interface:
+  display_name: "Web Security Playbook"
+  short_description: "Authorized web attack reference by category"
+  default_prompt: "Use $web-security-playbook to shortlist relevant web attack families and references for an authorized assessment."
+
+policy:
+  allow_implicit_invocation: false
