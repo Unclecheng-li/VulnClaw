@@ -285,11 +285,14 @@ class AgentCore:
 
             try:
                 # Call LLM with full conversation + round context
+                # Note: _call_llm_auto persists tool call results to context internally
+                # so we don't add the response again for the tool call path
                 response_text = await self._call_llm_auto(system_prompt, round_context)
                 result.output = response_text
 
-                # Add to conversation history
-                self.context.add_assistant_message(response_text)
+                # Add the LLM's final text response to context
+                # (tool call summaries are already added inside _call_llm_auto)
+                self.context.add_assistant_message(f"[Round {round_num} 分析] {response_text}")
 
                 # Parse findings
                 self._parse_findings(response_text)
@@ -344,12 +347,25 @@ class AgentCore:
         findings_summary = ""
         if state.findings:
             findings_summary = f"\n已发现漏洞: {len(state.findings)} 个"
-            for f in state.findings[-3:]:  # Show last 3 findings
-                findings_summary += f"\n  - [{f.severity}] {f.title}"
+            for f in state.findings[-5:]:  # Show last 5 findings
+                findings_summary += f"\n  - [{f.severity}] {f.title}: {f.evidence[:100]}"
 
         steps_summary = ""
         if state.executed_steps:
-            steps_summary = f"\n已执行步骤: {len(state.executed_steps)} 个"
+            # Show recent steps in more detail
+            recent_steps = state.executed_steps[-5:]
+            steps_summary = f"\n最近执行步骤: {len(state.executed_steps)} 个总计"
+            for s in recent_steps:
+                steps_summary += f"\n  - {s[:150]}"
+
+        recon_summary = ""
+        if state.recon_data:
+            recon_summary = f"\n侦察数据: {list(state.recon_data.keys())}"
+
+        # Include notes (important for CTF hints)
+        notes_summary = ""
+        if state.notes:
+            notes_summary = f"\n重要笔记: {'; '.join(state.notes[-5:])}"
 
         return (
             f"\n\n[自主循环 Round {round_num}/{max_rounds}]"
@@ -357,7 +373,10 @@ class AgentCore:
             f"\n当前阶段: {state.phase.value}"
             f"{findings_summary}"
             f"{steps_summary}"
-            f"\n\n请基于当前状态决定下一步操作，持续推进渗透测试。"
+            f"{recon_summary}"
+            f"{notes_summary}"
+            f"\n\n请基于当前状态和之前所有发现决定下一步操作，持续推进渗透测试。"
+            f"\n注意：不要重复之前已经做过的操作，专注于推进到下一步。"
             f"\n如果发现重要线索或完成测试，在回复末尾添加 [DONE] 标记。"
         )
 
@@ -439,6 +458,9 @@ class AgentCore:
 
         The round context is injected as the last user message to give
         the LLM awareness of the loop state.
+
+        IMPORTANT: Tool call results are persisted to self.context so that
+        subsequent rounds retain memory of what was discovered.
         """
         client = self._get_client()
 
@@ -508,6 +530,14 @@ class AgentCore:
                     "content": tool_result["content"],
                 })
 
+            # ★ Persist tool call results to context so later rounds remember them
+            tool_summary_parts = []
+            for tc in choice.message.tool_calls:
+                tool_summary_parts.append(f"调用工具: {tc.function.name}({tc.function.arguments[:200]})")
+            for tr in tool_results:
+                tool_summary_parts.append(f"工具结果: {tr['content'][:500]}")
+            self.context.add_assistant_message(" | ".join(tool_summary_parts))
+
             # Second LLM call with tool results
             try:
                 kwargs["messages"] = messages
@@ -515,7 +545,10 @@ class AgentCore:
                     None,
                     lambda: client.chat.completions.create(**kwargs),
                 )
-                return response2.choices[0].message.content or ""
+                final_text = response2.choices[0].message.content or ""
+                # Persist the follow-up LLM response too
+                self.context.add_assistant_message(final_text)
+                return final_text
             except Exception as e2:
                 # If the follow-up call fails, return what we have
                 return f"[tool results processed] 继续分析错误: {e2}"
@@ -653,7 +686,7 @@ class AgentCore:
         return tools
 
     def _parse_findings(self, response: str) -> None:
-        """Parse vulnerability findings from LLM response."""
+        """Parse vulnerability findings and key discoveries from LLM response."""
         from vulnclaw.agent.context import VulnerabilityFinding
 
         # Simple heuristic: look for severity markers
@@ -671,3 +704,19 @@ class AgentCore:
                     title=match.strip(),
                     severity=severity,
                 ))
+
+        # Extract key discoveries and record as notes for context persistence
+        discovery_markers = [
+            r'\[\+\]\s*(.+?)(?:\n|$)',        # [+] findings
+            r'发现[：:]\s*(.+?)(?:\n|$)',      # 发现: xxx
+            r'(flag\{[^}]+\})',               # flag{...}
+            r'(NSSCTF\{[^}]+\})',             # NSSCTF{...}
+            r'(CTF\{[^}]+\})',                # CTF{...}
+        ]
+        for pattern in discovery_markers:
+            matches = re.findall(pattern, response, re.IGNORECASE)
+            for match in matches:
+                note = match.strip()[:200]
+                # Avoid duplicate notes
+                if note and note not in self.context.state.notes:
+                    self.context.state.add_note(note)

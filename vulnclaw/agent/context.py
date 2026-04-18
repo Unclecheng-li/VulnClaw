@@ -87,7 +87,7 @@ class SessionState(BaseModel):
 class ContextManager:
     """Manages conversation context and session state."""
 
-    def __init__(self, max_history: int = 50) -> None:
+    def __init__(self, max_history: int = 200) -> None:
         self.max_history = max_history
         self.messages: list[dict[str, str]] = []
         self.state = SessionState()
@@ -117,10 +117,64 @@ class ContextManager:
         self.state = SessionState()
 
     def _trim(self) -> None:
-        """Trim old messages to stay within limit."""
-        if len(self.messages) > self.max_history:
-            # Keep the most recent messages
-            self.messages = self.messages[-self.max_history:]
+        """Trim old messages to stay within limit.
+
+        Instead of blindly dropping old messages, we compress them
+        into a summary to preserve key discoveries for multi-round loops.
+        """
+        if len(self.messages) <= self.max_history:
+            return
+
+        # Keep the most recent 70% of messages intact
+        keep_count = int(self.max_history * 0.7)
+        recent = self.messages[-keep_count:]
+        old = self.messages[:-keep_count]
+
+        # Compress old messages into a summary instead of discarding
+        summary = self._compress_messages(old)
+
+        self.messages = []
+        if summary:
+            self.messages.append({
+                "role": "user",
+                "content": f"[之前的会话摘要]\n{summary}",
+            })
+        self.messages.extend(recent)
+
+    @staticmethod
+    def _compress_messages(messages: list[dict[str, str]]) -> str:
+        """Compress a list of messages into a concise summary.
+
+        Extracts key findings, tool results, and discoveries from the
+        conversation history so the LLM doesn't completely lose context.
+        """
+        key_parts = []
+
+        for msg in messages:
+            content = msg.get("content", "")
+            # Extract tool call/result information — these contain actual findings
+            if "调用工具:" in content or "工具结果:" in content:
+                key_parts.append(content[:300])
+
+            # Extract lines that look like findings/discoveries
+            for line in content.split("\n"):
+                stripped = line.strip()
+                if any(marker in stripped for marker in [
+                    "[+]", "[!]", "发现", "漏洞", "flag", "CVE",
+                    "端口", "开放", "服务", "路径", "泄露", "注入",
+                    "Status:", "Headers:", "Body",
+                ]):
+                    key_parts.append(stripped[:200])
+
+        if not key_parts:
+            return ""
+
+        # Limit total summary size to avoid context bloat
+        summary = "\n".join(key_parts)
+        if len(summary) > 3000:
+            summary = summary[:3000] + "\n...(更多历史记录已省略)"
+
+        return summary
 
     def trim_messages(self, max_messages: int = 20) -> None:
         """Forcefully trim conversation history to a specific size.
