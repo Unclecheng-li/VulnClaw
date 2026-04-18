@@ -23,10 +23,11 @@ class TestSkillLoader:
         from vulnclaw.skills.loader import list_specialized_skills
         spec = list_specialized_skills()
         assert isinstance(spec, list)
-        assert len(spec) == 8
+        assert len(spec) == 9
         expected = ["web-pentest", "android-pentest", "client-reverse",
                      "web-security-advanced", "ai-mcp-security",
-                     "intranet-pentest-advanced", "pentest-tools", "rapid-checklist"]
+                     "intranet-pentest-advanced", "pentest-tools", "rapid-checklist",
+                     "crypto-toolkit"]
         for skill in expected:
             assert skill in spec, f"Missing specialized skill: {skill}"
 
@@ -143,6 +144,7 @@ class TestSkillLoader:
             ("rapid-checklist", "payloads.md"),
             ("web-pentest", "03-web-security-integrated.md"),
             ("android-pentest", "android-authorized-app-pentest-sop.md"),
+            ("crypto-toolkit", "encoding-cheatsheet.md"),
         ]
         for skill_name, ref_name in test_cases:
             skill = load_skill_by_name(skill_name)
@@ -262,3 +264,107 @@ class TestSkillDispatcher:
         skill1 = d.dispatch("SQL注入")
         skill2 = d.dispatch("sql注入")
         assert skill1["name"] == skill2["name"]
+
+    def test_dispatch_crypto_toolkit(self):
+        """Crypto-related inputs should dispatch to crypto-toolkit."""
+        d = self._make_dispatcher()
+        skill = d.dispatch("帮我base64解码")
+        assert skill["name"] == "crypto-toolkit"
+
+    def test_dispatch_crypto_hash(self):
+        d = self._make_dispatcher()
+        skill = d.dispatch("MD5哈希加密")
+        assert skill["name"] == "crypto-toolkit"
+
+
+# ── crypto_tools.py ────────────────────────────────────────────────
+
+class TestCryptoTools:
+    """Test the crypto toolkit module."""
+
+    def test_base64_decode(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("base64_decode", "TnNTY1RmLnBocA==")
+        assert result["success"] is True
+        assert result["result"] == "NsScTf.php"
+
+    def test_base64_encode(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("base64_encode", "NsScTf.php")
+        assert result["success"] is True
+        assert result["result"] == "TnNTY1RmLnBocA=="
+
+    def test_hex_decode(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("hex_decode", "4e73536354662e706870")
+        assert result["success"] is True
+        assert result["result"] == "NsScTf.php"
+
+    def test_url_decode(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("url_decode", "%2Fadmin")
+        assert result["success"] is True
+        assert result["result"] == "/admin"
+
+    def test_rot13(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("rot13_encode", "Hello")
+        assert result["success"] is True
+        assert result["result"] == "Uryyb"
+
+    def test_md5_hash(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("md5_hash", "admin")
+        assert result["success"] is True
+        assert result["result"] == "21232f297a57a5a743894a0e4a801fc3"
+
+    def test_auto_decode_base64(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("auto_decode", "TnNTY1RmLnBocA==")
+        assert result["success"] is True
+        assert "NsScTf.php" in result["result"]
+
+    def test_caesar_decode_brute(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("caesar_decode", "Khoor")
+        assert result["success"] is True
+        assert "Hello" in result["result"]
+
+    def test_morse_decode(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("morse_decode", ".... . .-.. .-.. ---")
+        assert result["success"] is True
+        assert "HELLO" in result["result"]
+
+    def test_jwt_decode(self):
+        from vulnclaw.skills.crypto_tools import execute
+        token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        result = execute("jwt_decode", token)
+        assert result["success"] is True
+        assert "HS256" in result["result"]
+
+    def test_unknown_operation(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("unknown_op", "test")
+        assert result["success"] is False
+        assert "未知操作" in result["error"]
+
+    def test_unicode_decode(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("unicode_decode", r"\u0048\u0065\u006c\u006c\u006f")
+        assert result["success"] is True
+        assert "Hello" in result["result"]
+
+    def test_html_decode(self):
+        from vulnclaw.skills.crypto_tools import execute
+        result = execute("html_decode", "&#x3C;script&#x3E;")
+        assert result["success"] is True
+        assert "<script>" in result["result"]
+
+    def test_list_operations(self):
+        from vulnclaw.skills.crypto_tools import list_operations
+        ops = list_operations()
+        assert len(ops) >= 25
+        assert "base64_decode" in ops
+        assert "auto_decode" in ops
+        assert "md5_hash" in ops

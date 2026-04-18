@@ -39,6 +39,12 @@ SKILL_INTENT_MAP: dict[str, list[str]] = {
     "sqlmap|nmap|nuclei|ffuf|burp|impacket|crackmapexec": ["pentest-tools"],
     "速查|payload|绕过提醒|快速验证|checklist|检查清单": ["rapid-checklist"],
     "payload大全|绕过|bypass|快速查|速查卡|快速回忆": ["rapid-checklist"],
+    # Crypto toolkit
+    "编码|解码|base64|base32|hex|url编码|加密|解密|哈希|hash": ["crypto-toolkit"],
+    "md5|sha|aes|des|rsa|jwt|rot13|caesar|morse|栅栏": ["crypto-toolkit"],
+    "base64解码|base64编码|hex解码|url解码|unicode解码|html解码": ["crypto-toolkit"],
+    "密码学|crypto|cipher|decrypt|encrypt|encode|decode": ["crypto-toolkit"],
+    "摩尔电码|凯撒密码|维吉尼亚|培根密码|base58": ["crypto-toolkit"],
 }
 
 

@@ -616,7 +616,7 @@ class AgentCore:
             return {}
 
     async def _execute_mcp_tool(self, tool_name: str, args: dict) -> str:
-        """Execute a tool call via MCP manager or built-in skill loader."""
+        """Execute a tool call via MCP manager or built-in tools."""
         # Built-in skill reference loader
         if tool_name == "load_skill_reference":
             try:
@@ -629,6 +629,27 @@ class AgentCore:
                 return f"[!] 参考文档未找到: {skill_name}/{ref_name}"
             except Exception as e:
                 return f"[!] 加载参考文档错误: {e}"
+
+        # Built-in crypto toolkit
+        if tool_name == "crypto_decode":
+            try:
+                from vulnclaw.skills.crypto_tools import execute as crypto_execute
+                operation = args.get("operation", "")
+                input_str = args.get("input", "")
+                # Build kwargs from optional params
+                kwargs = {}
+                for key in ("key", "iv", "shift", "secret", "header", "algorithm"):
+                    if key in args and args[key]:
+                        kwargs[key] = args[key]
+                        # Convert shift to int
+                        if key == "shift":
+                            kwargs[key] = int(args[key])
+                result = crypto_execute(operation=operation, input_str=input_str, **kwargs)
+                if result.get("success"):
+                    return f"[✓] {operation} 结果:\n{result['result']}"
+                return f"[!] {operation} 失败: {result.get('error', '未知错误')}"
+            except Exception as e:
+                return f"[!] 加密工具执行错误: {e}"
 
         # Route to MCP manager
         if not self.mcp_manager:
@@ -655,14 +676,70 @@ class AgentCore:
                     "properties": {
                         "skill_name": {
                             "type": "string",
-                            "description": "Skill 名称，如 client-reverse, web-security-advanced, ai-mcp-security, intranet-pentest-advanced, pentest-tools, rapid-checklist",
+                            "description": "Skill 名称，如 client-reverse, web-security-advanced, ai-mcp-security, intranet-pentest-advanced, pentest-tools, rapid-checklist, crypto-toolkit",
                         },
                         "reference_name": {
                             "type": "string",
-                            "description": "参考文档文件名，如 02-client-api-reverse-and-burp.md, web-injection.md",
+                            "description": "参考文档文件名，如 02-client-api-reverse-and-burp.md, web-injection.md, encoding-cheatsheet.md",
                         },
                     },
                     "required": ["skill_name", "reference_name"],
+                },
+            },
+        })
+
+        # Built-in crypto toolkit
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "crypto_decode",
+                "description": (
+                    "编码解码与加解密工具。遇到 base64/hex/URL/HTML/Unicode 编码字符串、"
+                    "需要计算哈希、解密 AES/DES、解析 JWT 等场景时调用此工具。"
+                    "重要：不要自行脑补解码结果，始终使用此工具确保准确性。"
+                    "支持操作：base64_encode/decode, base32_encode/decode, base58_encode/decode, "
+                    "hex_encode/decode, url_encode/decode, html_encode/decode, unicode_encode/decode, "
+                    "rot13_encode/decode, caesar_encode/decode, morse_encode/decode, "
+                    "md5_hash, sha1_hash, sha256_hash, sha512_hash, "
+                    "aes_encrypt/decrypt, jwt_decode/encode, auto_decode"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "description": (
+                                "操作名称。编码: base64_encode, base32_encode, base58_encode, hex_encode, "
+                                "url_encode, html_encode, unicode_encode, rot13_encode, caesar_encode, morse_encode. "
+                                "解码: base64_decode, base32_decode, base58_decode, hex_decode, url_decode, "
+                                "html_decode, unicode_decode, rot13_decode, caesar_decode, morse_decode, auto_decode. "
+                                "哈希: md5_hash, sha1_hash, sha256_hash, sha512_hash. "
+                                "加密/解密: aes_encrypt, aes_decrypt. "
+                                "JWT: jwt_decode, jwt_encode"
+                            ),
+                        },
+                        "input": {
+                            "type": "string",
+                            "description": "待处理的输入字符串（待编码/解码/哈希/加密的文本）",
+                        },
+                        "key": {
+                            "type": "string",
+                            "description": "加密/解密密钥（AES/DES 需要，16/24/32字节）",
+                        },
+                        "iv": {
+                            "type": "string",
+                            "description": "AES 初始化向量（16字节，可选）",
+                        },
+                        "shift": {
+                            "type": "integer",
+                            "description": "Caesar 密码位移量（默认3，解码时不提供则暴力所有位移）",
+                        },
+                        "secret": {
+                            "type": "string",
+                            "description": "JWT 签名密钥",
+                        },
+                    },
+                    "required": ["operation", "input"],
                 },
             },
         })
