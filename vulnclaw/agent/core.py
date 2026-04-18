@@ -159,15 +159,14 @@ class AgentCore:
 
     def _detect_target(self, user_input: str) -> Optional[str]:
         """Extract target from user input."""
+        # Try to find URL (with optional port)
+        url_match = re.search(r'(https?://[a-zA-Z0-9][-a-zA-Z0-9.:]*)', user_input)
+        if url_match:
+            return url_match.group(1).rstrip("/")
         # Try to find IP address
         ip_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', user_input)
         if ip_match:
             return ip_match.group(1)
-
-        # Try to find URL
-        url_match = re.search(r'(https?://\S+)', user_input)
-        if url_match:
-            return url_match.group(1).rstrip("/")
 
         # Try to find domain
         domain_match = re.search(r'([a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z]{2,})', user_input)

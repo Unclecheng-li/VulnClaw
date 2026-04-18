@@ -162,6 +162,19 @@ $ vulnclaw
 | `help`                | 显示帮助信息                     |
 | `exit` / `quit` / `q` | 退出 VulnClaw                    |
 
+#### 自主渗透模式
+
+VulnClaw 检测到以下关键词 + 目标时，自动进入多轮自主渗透循环：
+
+| 触发方式 | 示例 |
+| -------- | ---- |
+| 渗透指令 | `对 http://target.com 进行渗透测试` |
+| CTF / 找 flag | `帮我对 http://ctf.site 找出flag` |
+| 爆破 / 绕过 | `对 http://target.com 弱口令爆破` |
+| **显式触发** | `目标：http://target.com，进入自主渗透模式` |
+
+> 💡 输入 `Ctrl+C` 可随时中断自主循环。切换目标时自动重置会话上下文。
+
 ### 方式二：单命令模式
 
 ```bash

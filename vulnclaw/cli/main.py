@@ -145,6 +145,14 @@ def _run_repl() -> None:
             # Route to agent — detect if this should be an autonomous loop
             is_auto_mode = _should_auto_pentest(user_input, current_target)
 
+            # Detect target switch — if user mentions a new target, reset context
+            new_target = _extract_target_from_input(user_input)
+            if new_target and current_target and new_target != current_target:
+                console.print(f"[dim][*] 目标切换: {current_target} → {new_target}，重置会话上下文[/]")
+                current_target = new_target
+                current_phase = "信息收集"
+                agent.reset_context()
+
             try:
                 if is_auto_mode:
                     # Autonomous pentest loop
@@ -595,6 +603,7 @@ def _should_auto_pentest(user_input: str, current_target: Optional[str]) -> bool
     Triggers when:
     - User explicitly asks for a full pentest with a target
     - User mentions a target + action keywords like "渗透测试", "打一下"
+    - User asks to solve a CTF / find a flag with a target
     - A target is set and the request is broad (not a specific single-step query)
     """
     input_lower = user_input.lower()
@@ -603,6 +612,12 @@ def _should_auto_pentest(user_input: str, current_target: Optional[str]) -> bool
     auto_keywords = [
         "渗透测试", "进行渗透", "做渗透", "打一下", "全面测试",
         "pentest", "full test", "auto",
+        # Explicit auto-mode command
+        "进入自主渗透模式", "自主渗透模式", "自主模式",
+        # CTF / challenge triggers
+        "找出flag", "找到flag", "拿flag", "get flag", "find flag",
+        "解题", "做题", "挑战", "challenge", "ctf",
+        "弱口令", "爆破", "绕过", "bypass", "brute",
     ]
 
     # Single-step queries should NOT trigger auto mode
@@ -629,6 +644,10 @@ def _should_auto_pentest(user_input: str, current_target: Optional[str]) -> bool
 def _extract_target_from_input(user_input: str) -> Optional[str]:
     """Extract target from user input string."""
     import re
+    # Try to find URL (with optional port)
+    url_match = re.search(r'(https?://[a-zA-Z0-9][-a-zA-Z0-9.:]*)', user_input)
+    if url_match:
+        return url_match.group(1).rstrip("/")
     # Try to find IP address
     ip_match = re.search(r'(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', user_input)
     if ip_match:
