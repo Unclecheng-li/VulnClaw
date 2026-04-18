@@ -122,6 +122,7 @@ class SessionConfig(BaseModel):
     auto_save: bool = Field(default=True, description="Auto-save session state")
     report_format: str = Field(default="markdown", description="Default report format: markdown, html")
     poc_language: str = Field(default="python", description="Default PoC language: python, bash")
+    max_rounds: int = Field(default=15, description="Max autonomous pentest rounds (1-100)")
 
 
 class VulnClawConfig(BaseModel):

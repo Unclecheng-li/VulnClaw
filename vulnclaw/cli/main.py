@@ -170,7 +170,7 @@ def _run_repl() -> None:
                         results = await agent.auto_pentest(
                             user_input,
                             target=current_target,
-                            max_rounds=15,
+                            max_rounds=config.session.max_rounds,
                             on_step=on_step,
                         )
                         return results
@@ -291,7 +291,7 @@ def run(
         results = await agent.auto_pentest(
             prompt,
             target=target,
-            max_rounds=15,
+            max_rounds=config.session.max_rounds,
             on_step=lambda r, res: console.print(f"[dim]Round {r}[/]: {res.output[:200]}...") if res.output else None,
         )
         return results
