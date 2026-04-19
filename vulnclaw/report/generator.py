@@ -174,3 +174,164 @@ def _summarize_attack_surface(session: SessionState) -> str:
         parts.append(f"WAF: {recon['waf']}")
 
     return "; ".join(parts) if parts else "未收集"
+
+
+# ── Persistent Pentest Cycle Report ──────────────────────────────────
+
+CYCLE_REPORT_TEMPLATE = """\
+# 持续性渗透测试 — 周期报告
+
+## 周期信息
+
+| 项目 | 详情 |
+|------|------|
+| **测试目标** | {{ target }} |
+| **当前周期** | 第 {{ cycle_num }} 周期 |
+| **每周期轮数** | {{ rounds_per_cycle }} |
+| **本周期新增漏洞** | {{ new_findings }} 个 |
+| **累计发现漏洞** | {{ total_findings }} 个 |
+| **累计执行步骤** | {{ total_steps }} 个 |
+| **报告生成时间** | {{ generated_at }} |
+
+## 本周期漏洞发现
+
+{% for finding in cycle_findings %}
+### {{ finding.title }} — [{{ finding.severity }}]
+
+- **漏洞类型**: {{ finding.vuln_type }}
+- **CVE**: {{ finding.cve or "N/A" }}
+- **验证证据**: {{ finding.evidence }}
+- **修复建议**: {{ finding.remediation or "请根据漏洞类型采取相应修复措施" }}
+
+{% endfor %}
+
+{% if not cycle_findings %}
+本周期未发现新漏洞，已对已有攻击面进行深入验证。
+{% endif %}
+
+## 累计漏洞汇总
+
+| # | 漏洞标题 | 等级 | 类型 |
+|---|---------|------|------|
+{% for finding in all_findings %}
+| {{ loop.index }} | {{ finding.title }} | {{ finding.severity }} | {{ finding.vuln_type }} |
+{% endfor %}
+
+{% if not all_findings %}
+暂未发现漏洞
+{% endif %}
+
+## 风险等级分布
+
+| 等级 | 数量 |
+|------|------|
+| Critical | {{ critical_count }} |
+| High | {{ high_count }} |
+| Medium | {{ medium_count }} |
+| Low/Info | {{ low_count }} |
+
+## 攻击路径摘要
+
+{% for step in recent_steps %}
+{{ loop.index }}. {{ step }}
+{% endfor %}
+
+## 关键建议
+
+{% for rec in recommendations %}
+{{ loop.index }}. {{ rec }}
+{% endfor %}
+
+---
+
+> 🦞 持续性渗透测试周期报告 | VulnClaw | {{ generated_at }}
+"""
+
+
+def generate_persistent_cycle_report(
+    session: SessionState,
+    cycle_num: int,
+    total_findings: int,
+    new_findings: int,
+    total_steps: int,
+    rounds_per_cycle: int,
+    output_path: Optional[str] = None,
+) -> Path:
+    """Generate a cycle report for persistent pentest.
+
+    Args:
+        session: Current session state with findings.
+        cycle_num: Current cycle number (1-based).
+        total_findings: Total findings so far (cumulative).
+        new_findings: New findings in this cycle.
+        total_steps: Total executed steps so far (cumulative).
+        rounds_per_cycle: Rounds per cycle.
+        output_path: Output file path. If None, auto-generate.
+
+    Returns:
+        Path to the generated report file.
+    """
+    from vulnclaw import __version__
+
+    # Count findings by severity
+    severity_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
+    for finding in session.findings:
+        sev = finding.severity
+        if sev in severity_counts:
+            severity_counts[sev] += 1
+        else:
+            severity_counts["Medium"] += 1
+
+    # Findings discovered in this cycle (last new_findings items)
+    cycle_findings = session.findings[-new_findings:] if new_findings > 0 else []
+
+    # Generate recommendations from high/critical findings
+    recommendations = []
+    for finding in session.findings:
+        if finding.severity in ("Critical", "High"):
+            rec = finding.remediation or f"修复 {finding.vuln_type} 漏洞: {finding.title}"
+            if rec not in recommendations:
+                recommendations.append(rec)
+    if not recommendations:
+        recommendations.append("暂无高危发现，继续深入测试")
+
+    # Recent steps (last 20 to avoid bloat)
+    recent_steps = session.executed_steps[-20:]
+
+    context = {
+        "target": session.target or "未指定",
+        "cycle_num": cycle_num,
+        "rounds_per_cycle": rounds_per_cycle,
+        "new_findings": new_findings,
+        "total_findings": total_findings,
+        "total_steps": total_steps,
+        "generated_at": datetime.now().isoformat(),
+        "version": __version__,
+        "cycle_findings": cycle_findings,
+        "all_findings": session.findings,
+        "critical_count": severity_counts["Critical"],
+        "high_count": severity_counts["High"],
+        "medium_count": severity_counts["Medium"],
+        "low_count": severity_counts["Low"] + severity_counts["Info"],
+        "recent_steps": recent_steps,
+        "recommendations": recommendations,
+    }
+
+    # Render report
+    template = Template(CYCLE_REPORT_TEMPLATE)
+    report_content = template.render(**context)
+
+    # Determine output path
+    if output_path is None:
+        from vulnclaw.config.settings import SESSIONS_DIR
+        safe_target = (session.target or "unknown").replace("/", "_").replace(":", "_")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = str(
+            SESSIONS_DIR / f"persistent_cycle{cycle_num:03d}_{timestamp}_{safe_target}.md"
+        )
+
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(report_content, encoding="utf-8")
+
+    return output

@@ -107,7 +107,24 @@ crypto_decode(operation="base64_decode", input="TnNTY1RmLnBocA==")
 - **JWT**: `jwt_decode`, `jwt_encode`
 - **自动识别**: `auto_decode` (自动识别编码类型并解码)
 
+## CTF 密码学攻击路由
+
+> 当遇到密码学攻击场景（已知加密算法，需要恢复明文或密钥）时，优先使用 `ctf-crypto` Skill：
+
+| 攻击场景 | 路由到 ctf-crypto | 参考文档 |
+|---------|-----------------|---------|
+| RSA 小指数/共模/Wiener | `ctf-crypto` | `references/rsa-attacks-cheatsheet.md` |
+| AES Padding Oracle/ECB 翻转 | `ctf-crypto` | `references/aes-and-block-cipher-attacks.md` |
+| ECC 小子群/离散对数 | `ctf-crypto` | `references/ecc-attacks-cheatsheet.md` |
+| PRNG/MT19937 预测 | `ctf-crypto` | `references/prng-and-stream-cipher-attacks.md` |
+| 古典密码（Vigenere/XOR） | `ctf-crypto` | `references/classic-cipher-attacks.md` |
+| 格攻击/LWE | `ctf-crypto` | `references/lattice-and-lwe-attacks.md` |
+
+**本 Skill 侧重编解码操作工具**，密码学具体攻击方法和参数请参考 `ctf-crypto`。
+
 ## 参考文档
 
 - `references/encoding-cheatsheet.md` — 编码识别速查表
 - `references/crypto-attacks.md` — 密码学攻击手法
+- `references/crypto-attacks-roadmap.md` — 密码学攻击分类路由（根据题目特征选择攻击方法）
+

@@ -59,10 +59,16 @@ def _print_banner() -> None:
 
 def _print_agent_output(output: str, config) -> None:
     """Print agent output with think-tag filtering based on config."""
-    from vulnclaw.agent.core import format_think_tags
+    from vulnclaw.agent.core import format_think_tags, strip_think_tags
     formatted = format_think_tags(output, show=config.session.show_thinking)
     if formatted:
         console.print(formatted)
+    elif not config.session.show_thinking:
+        # Check if the original output had thinking content that was stripped
+        stripped = strip_think_tags(output)
+        had_thinking = (stripped != output) and not stripped
+        if had_thinking:
+            console.print("[dim]  (LLM 仅输出了推理过程，无实际回答内容)[/dim]")
 
 
 # ── REPL ────────────────────────────────────────────────────────────
@@ -149,6 +155,88 @@ def _run_repl() -> None:
                         console.print(f"  • {tool}")
                 else:
                     console.print("[-] 无可用 MCP 工具")
+                continue
+
+            elif cmd_lower.startswith("persistent"):
+                # Persistent pentest mode from REPL
+                persistent_target = current_target
+                if not persistent_target:
+                    # Try to extract from rest of input
+                    rest = user_input[len("persistent"):].strip()
+                    if rest:
+                        persistent_target = rest
+                    else:
+                        console.print("[!] 请先设置目标: [bold]target <host>[/] 或 [bold]persistent <host>[/]")
+                        continue
+
+                from vulnclaw.agent.core import PersistentCycleResult
+
+                rounds_per_cycle = config.session.persistent_rounds_per_cycle
+                max_cycles = config.session.persistent_max_cycles
+                auto_report = config.session.persistent_auto_report
+
+                console.print(Panel(
+                    f"🎯 目标: [bold]{persistent_target}[/]\n"
+                    f"🔄 每周期轮数: [bold]{rounds_per_cycle}[/]\n"
+                    f"🔁 最大周期数: [bold]{max_cycles}[/]\n"
+                    f"📝 自动报告: {'[green]开[/]' if auto_report else '[yellow]关[/]'}",
+                    title="🦞 持续性渗透测试",
+                    border_style="cyan",
+                ))
+
+                persistent_prompt = f"对已授权的目标 {persistent_target} 进行持续性深入渗透测试，这是我的授权靶场"
+
+                all_cycle_results: list[PersistentCycleResult] = []
+
+                def _on_persistent_step(round_num: int, cycle_num: int, result) -> None:
+                    console.print(f"[dim]── Cycle {cycle_num} | Round {round_num} ──[/]")
+                    if result.output:
+                        _print_agent_output(result.output, config)
+                    console.print()
+                    nonlocal current_target, current_phase
+                    if result.target:
+                        current_target = result.target
+                    if result.phase:
+                        current_phase = result.phase
+
+                def _on_persistent_cycle(cycle_num: int, cycle_result: PersistentCycleResult) -> None:
+                    all_cycle_results.append(cycle_result)
+                    console.print(Panel(
+                        f"✅ 周期 {cycle_num} 完成\n"
+                        f"   累计漏洞: {cycle_result.total_findings}\n"
+                        f"   本轮新增: {cycle_result.new_findings}\n"
+                        f"   报告: {cycle_result.report_path or '未生成'}",
+                        title=f"🦞 周期 {cycle_num}",
+                        border_style="green" if cycle_result.new_findings == 0 else "red",
+                    ))
+                    console.print()
+
+                try:
+                    async def _run_persistent():
+                        return await agent.persistent_pentest(
+                            user_input=persistent_prompt,
+                            target=persistent_target,
+                            rounds_per_cycle=rounds_per_cycle,
+                            max_cycles=max_cycles,
+                            auto_report=auto_report,
+                            on_cycle_step=_on_persistent_step,
+                            on_cycle_complete=_on_persistent_cycle,
+                        )
+
+                    asyncio.run(_run_persistent())
+                except KeyboardInterrupt:
+                    console.print("\n[!] 用户中断持续性渗透测试")
+                    if agent.session_state.findings:
+                        try:
+                            from vulnclaw.report.generator import generate_report
+                            final_report = generate_report(agent.session_state)
+                            console.print(f"[+] 最终报告: {final_report}")
+                        except Exception:
+                            pass
+
+                # Summary
+                tf = len(agent.session_state.findings)
+                console.print(f"\n[+] 持续性渗透完成，完成 {len(all_cycle_results)} 个周期，发现 {tf} 个漏洞")
                 continue
 
             elif cmd_lower == "think":
@@ -268,6 +356,8 @@ def _print_help() -> None:
   [cyan]tools[/]           列出可用 MCP 工具
   [cyan]think[/]           切换推理过程显示/隐藏
   [cyan]think on/off[/]    精确控制推理过程显示
+  [cyan]persistent[/]      启动持续性渗透测试（每周期100轮，自动报告）
+  [cyan]persistent <host>[/] 对指定目标启动持续性渗透
   [cyan]clear[/]           清空当前会话
   [cyan]help[/]            显示此帮助
   [cyan]exit / quit[/]     退出
@@ -275,6 +365,12 @@ def _print_help() -> None:
 [bold]自主渗透模式[/]:
   [dim]输入包含目标的渗透指令，VulnClaw 会自动循环执行[/]
   [dim]例如: 对 www.example.com 进行渗透测试[/]
+
+[bold]持续性渗透模式[/]:
+  [dim]每周期100轮自主渗透 → 自动报告 → 继续下一周期[/]
+  [dim]直到手动 Ctrl+C 终止或达到最大周期数（默认10）[/]
+  [dim]CLI: vulnclaw persistent <target> --rounds 100 --cycles 10[/]
+  [dim]REPL: persistent 或 persistent <host>[/]
 
 [bold]自然语言示例[/]:
   [dim]对 192.168.1.100 进行渗透测试，这是我授权的靶场[/]
@@ -346,6 +442,132 @@ def run(
         from vulnclaw.report.generator import generate_report
         generate_report(agent.session_state, output)
         console.print(f"[+] 报告已保存: {output}")
+
+    mcp_manager.stop_all()
+
+
+@app.command()
+def persistent(
+    target: str = typer.Argument(..., help="Target host/IP/URL"),
+    rounds: int = typer.Option(0, "--rounds", "-r", help="Rounds per cycle (0=use config, default 100)"),
+    cycles: int = typer.Option(0, "--cycles", "-c", help="Max cycles (0=use config, default 10)"),
+    no_report: bool = typer.Option(False, "--no-report", help="Disable auto report after each cycle"),
+) -> None:
+    """🔄 持续性渗透测试 — 循环攻击直到手动终止或达到阈值.
+
+    每个周期执行指定轮数的自主渗透，周期结束自动生成报告，
+    然后继续下一周期。默认每周期 100 轮，最多 10 个周期（共 1000 轮）。
+
+    按 Ctrl+C 可随时中断当前周期，VulnClaw 会生成本周期报告后退出。
+    """
+    from vulnclaw.agent.core import AgentCore, PersistentCycleResult
+    from vulnclaw.mcp.lifecycle import MCPLifecycleManager
+
+    config = load_config()
+    if not config.llm.api_key:
+        err_console.print("[!] 请先配置 LLM API Key")
+        raise typer.Exit(1)
+
+    # Resolve parameters (CLI override → config defaults)
+    rounds_per_cycle = rounds if rounds > 0 else config.session.persistent_rounds_per_cycle
+    max_cycles = cycles if cycles > 0 else config.session.persistent_max_cycles
+    auto_report = not no_report if no_report else config.session.persistent_auto_report
+
+    console.print(Panel(
+        f"🎯 目标: [bold]{target}[/]\n"
+        f"🔄 每周期轮数: [bold]{rounds_per_cycle}[/]\n"
+        f"🔁 最大周期数: [bold]{max_cycles}[/] {'(无限)' if max_cycles == 0 else ''}\n"
+        f"📝 自动报告: {'[green]开[/]' if auto_report else '[yellow]关[/]'}\n"
+        f"📊 总轮数上限: [bold]{rounds_per_cycle * max_cycles if max_cycles > 0 else '无限'}[/]",
+        title="🦞 持续性渗透测试",
+        border_style="cyan",
+    ))
+
+    mcp_manager = MCPLifecycleManager(config)
+    started = mcp_manager.start_enabled_servers()
+    console.print(f"[*] MCP 工具链: {started} 个服务已启动\n")
+
+    agent = AgentCore(config, mcp_manager)
+
+    prompt = f"对已授权的目标 {target} 进行持续性深入渗透测试，这是我的授权靶场"
+
+    # Track stats
+    all_cycle_results: list[PersistentCycleResult] = []
+    interrupted = False
+
+    def _on_cycle_step(round_num: int, cycle_num: int, result) -> None:
+        """Real-time output for each step within a cycle."""
+        console.print(f"[dim]── Cycle {cycle_num} | Round {round_num} ──[/]")
+        if result.output:
+            _print_agent_output(result.output, config)
+        console.print()
+
+    def _on_cycle_complete(cycle_num: int, cycle_result: PersistentCycleResult) -> None:
+        """Callback after each cycle completes."""
+        all_cycle_results.append(cycle_result)
+        console.print(Panel(
+            f"✅ 周期 {cycle_num} 完成\n"
+            f"   执行步骤: {cycle_result.total_steps}\n"
+            f"   累计漏洞: {cycle_result.total_findings}\n"
+            f"   本轮新增: {cycle_result.new_findings}\n"
+            f"   报告: {cycle_result.report_path or '未生成'}",
+            title=f"🦞 周期 {cycle_num} 结果",
+            border_style="green" if cycle_result.new_findings == 0 else "red",
+        ))
+        console.print()
+
+    try:
+        async def _run():
+            return await agent.persistent_pentest(
+                user_input=prompt,
+                target=target,
+                rounds_per_cycle=rounds_per_cycle,
+                max_cycles=max_cycles,
+                auto_report=auto_report,
+                on_cycle_step=_on_cycle_step,
+                on_cycle_complete=_on_cycle_complete,
+            )
+
+        cycle_results = asyncio.run(_run())
+
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("\n[!] 用户中断持续性渗透测试")
+
+        # Generate final report for the interrupted session
+        if agent.session_state.findings:
+            try:
+                from vulnclaw.report.generator import generate_report
+                final_report = generate_report(agent.session_state)
+                console.print(f"[+] 中断时最终报告已保存: {final_report}")
+            except Exception as e:
+                console.print(f"[!] 中断时报告生成失败: {e}")
+
+    # Final summary
+    total_findings = len(agent.session_state.findings)
+    total_steps = len(agent.session_state.executed_steps)
+    completed_cycles = len(all_cycle_results)
+
+    console.print()
+    console.print(Panel(
+        f"{'🛑 用户中断' if interrupted else '🏁 测试完成'}\n\n"
+        f"  完成周期: [bold]{completed_cycles}[/]\n"
+        f"  执行步骤: [bold]{total_steps}[/]\n"
+        f"  发现漏洞: [bold]{total_findings}[/]\n\n"
+        f"  严重: {sum(1 for f in agent.session_state.findings if f.severity == 'Critical')} | "
+        f"高危: {sum(1 for f in agent.session_state.findings if f.severity == 'High')} | "
+        f"中危: {sum(1 for f in agent.session_state.findings if f.severity == 'Medium')} | "
+        f"低危: {sum(1 for f in agent.session_state.findings if f.severity in ('Low', 'Info'))}",
+        title="🦞 持续性渗透测试总结",
+        border_style="red" if total_findings > 0 else "green",
+    ))
+
+    # List generated cycle reports
+    if auto_report and all_cycle_results:
+        console.print("\n[bold]📊 周期报告列表[/]:")
+        for cr in all_cycle_results:
+            if cr.report_path and "失败" not in str(cr.report_path):
+                console.print(f"  周期 {cr.cycle_num}: {cr.report_path}")
 
     mcp_manager.stop_all()
 

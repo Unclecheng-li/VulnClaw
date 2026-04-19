@@ -26,7 +26,7 @@ SKILL_INTENT_MAP: dict[str, list[str]] = {
     "逆向|reverse|签名恢复|burp重放|js签名|客户端逆向|请求链|重放|签名": ["client-reverse"],
     "抓包|packet|frida|jadx|hook|ssl pinning|scrcpy": ["client-reverse"],
     "浏览器签名|反爬|antibot|token生成|cookie跳转": ["client-reverse"],
-    "web高级|注入|sql注入|xss|ssrf|ssti|xxe|命令注入|反序列化": ["web-security-advanced"],
+    "web高级|注入|sql注入|xss|ssrf|ssti|xxe|命令注入|反序列化|rce|远程代码执行": ["web-security-advanced"],
     "cors|graphql|websocket|oauth|请求走私|jwt|csrf|原型污染": ["web-security-advanced"],
     "认证漏洞|逻辑漏洞|越权|idor|支付逻辑|文件上传|路径穿越": ["web-security-advanced"],
     "ai安全|mcp安全|prompt注入|工具滥用|agent安全|模型安全": ["ai-mcp-security"],
@@ -45,6 +45,22 @@ SKILL_INTENT_MAP: dict[str, list[str]] = {
     "base64解码|base64编码|hex解码|url解码|unicode解码|html解码": ["crypto-toolkit"],
     "密码学|crypto|cipher|decrypt|encrypt|encode|decode": ["crypto-toolkit"],
     "摩尔电码|凯撒密码|维吉尼亚|培根密码|base58": ["crypto-toolkit"],
+    # ── CTF specialized skills ──────────────────────────────────────
+    # ctf-web: CTF Web 攻击知识库
+    "ctf|夺旗|flag|弱比较|空格绕过|正则绕过|rce|代码审计|eval绕过|highlight_file": ["ctf-web"],
+    "0e|md5绕过|preg_match绕过|类型绕过|type juggling|弱类型": ["ctf-web"],
+    "回显|无回显|blind rce|命令执行绕过|php代码审计|ssti注入": ["ctf-web"],
+    # ctf-crypto: CTF 密码学攻击知识库
+    "rsa攻击|小指数|共模攻击|wiener|coppersmith|padding oracle": ["ctf-crypto"],
+    "ecc攻击|小子群|离散对数|ecdsa|ed25519|pohlig-hellman": ["ctf-crypto"],
+    "lfsr|lcg|prng|mt19937|随机数预测|流密码": ["ctf-crypto"],
+    "lwe|格攻击|lll|cvp|svp|格基规约": ["ctf-crypto"],
+    "古典密码|维吉尼亚|凯撒|栅栏|替换密码|频率分析": ["ctf-crypto"],
+    # ctf-misc: CTF 杂项知识库
+    "pyjail|python沙箱|jail逃逸|sandbox_escape|python jail": ["ctf-misc"],
+    "bashjail|bash沙箱|restricted shell|rbash逃逸": ["ctf-misc"],
+    "编码链|多层编码|杂项|misc|隐写|stego": ["ctf-misc"],
+    "ctfd|夺旗平台|flag提交|题目下载": ["ctf-misc"],
 }
 
 

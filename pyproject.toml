@@ -7,17 +7,12 @@ name = "vulnclaw"
 version = "0.1.0"
 description = "🦞 AI-powered penetration testing CLI tool for cybersecurity professionals"
 readme = "README.md"
-license = "MIT"
+license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [
-    { name = "UncleC" },
+    { name = "UncleC", email = "iamloli@foxmail.com" },
 ]
 keywords = ["pentest", "security", "ai", "mcp", "cli", "vulnerability", "red-team"]
-
-[project.urls]
-Homepage = "https://github.com/Unclecheng-li/VulnClaw"
-Repository = "https://github.com/Unclecheng-li/VulnClaw"
-Issues = "https://github.com/Unclecheng-li/VulnClaw/issues"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Information Technology",
@@ -29,7 +24,6 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Security",
 ]
-
 dependencies = [
     "typer>=0.12.0",
     "rich>=13.0.0",
@@ -53,6 +47,11 @@ dev = [
 kb = [
     "chromadb>=0.4.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Unclecheng-li/VulnClaw"
+Repository = "https://github.com/Unclecheng-li/VulnClaw"
+Issues = "https://github.com/Unclecheng-li/VulnClaw/issues"
 
 [project.scripts]
 vulnclaw = "vulnclaw.cli.main:app"

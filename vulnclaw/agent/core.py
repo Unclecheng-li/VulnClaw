@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -12,36 +16,54 @@ from vulnclaw.agent.context import ContextManager, PentestPhase, SessionState
 from vulnclaw.agent.prompts import build_system_prompt, AUTO_PENTEST_INSTRUCTION
 
 
-# ── Think tag filtering ─────────────────────────────────────────────
+# ── Think tag filtering ────────────────────────────────────────
 
-_THINK_PATTERN = re.compile(
+# Closed think blocks: <think>...</think> or <thinking>...</thinking>
+_THINK_CLOSED = re.compile(
     r"<(?:think|thinking)>.*?</(?:think|thinking)>",
     re.DOTALL | re.IGNORECASE,
 )
 
+# Unclosed think blocks: <thinking>... (no closing tag, extends to end of text)
+# This is common with DeepSeek R1 and other reasoning models that output
+# <thinking> without a matching </thinking>
+_THINK_UNCLOSED = re.compile(
+    r"<(?:think|thinking)>.*",
+    re.DOTALL | re.IGNORECASE,
+)
+
+# Opening/closing tag patterns for extracting inner content
+_OPEN_TAG = re.compile(r"^<(?:think|thinking)>", re.IGNORECASE)
+_CLOSE_TAG = re.compile(r"</(?:think|thinking)>$", re.IGNORECASE)
+
 
 def strip_think_tags(text: str) -> str:
-    """Remove all <think>...</think> and <thinking>...</thinking> blocks from text."""
-    return _THINK_PATTERN.sub("", text).strip()
+    """Remove all <think>/<thinking> blocks from text.
+    
+    Handles both closed and unclosed think tags.
+    Many reasoning models (DeepSeek R1, etc.) output <thinking> without
+    a closing </thinking> tag, causing the rest of the content to be
+    swallowed as part of the thinking block.
+    """
+    # First pass: remove closed blocks
+    text = _THINK_CLOSED.sub("", text)
+    # Second pass: remove unclosed blocks (tag with no closing, eats rest of text)
+    text = _THINK_UNCLOSED.sub("", text)
+    return text.strip()
 
 
 def format_think_tags(text: str, show: bool) -> str:
     """Format output based on show_thinking setting.
 
-    If show=True:  keep think tags but dim them with Rich markup.
-    If show=False: strip think tags entirely.
+    If show=True:  keep think tags and content as-is (untouched).
+    If show=False: strip think tags and their content entirely.
+    
+    Handles both closed and unclosed think tags.
     """
     if show:
-        # Dim the think content but keep it visible
-        def _dim_think(match: re.Match) -> str:
-            content = match.group(0)
-            # Extract inner content
-            inner = re.sub(r"^<(?:think|thinking)>", "", content, flags=re.IGNORECASE)
-            inner = re.sub(r"</(?:think|thinking)>$", "", inner, flags=re.IGNORECASE)
-            return f"[dim]<think>{inner}[/dim]"
-        return _THINK_PATTERN.sub(_dim_think, text)
+        # Return the text as-is — thinking tags and content are preserved
+        return text
     return strip_think_tags(text)
-
 
 @dataclass
 class AgentResult:
@@ -53,6 +75,19 @@ class AgentResult:
     tool_calls: list[dict] = field(default_factory=list)
     findings: list[dict] = field(default_factory=list)
     should_continue: bool = True  # Whether the agent should keep looping
+
+
+@dataclass
+class PersistentCycleResult:
+    """Result from a single persistent pentest cycle."""
+
+    cycle_num: int = 0
+    results: list = field(default_factory=list)  # list[AgentResult]
+    report_path: Optional[str] = None
+    total_findings: int = 0
+    total_steps: int = 0
+    new_findings: int = 0
+    stopped_early: bool = False  # User interrupted or hard limit reached
 
 
 class AgentCore:
@@ -300,6 +335,27 @@ class AgentCore:
         # Reset flag verification state for this run
         self._claimed_flag = None
         self._flag_verified = False
+        self._flag_claim_count = 0  # Track how many times the same flag is claimed
+        self._post_flag_rounds = 0  # Track rounds after flag is verified (safety exit)
+
+        # ★ Dead-loop detection: track rounds without progress
+        self._rounds_without_progress = 0
+        self._last_findings_count = 0
+        self._last_notes_count = 0
+        self._last_steps_count = 0
+
+        # ★ Attack path tracking: detect when the agent is stuck on one path
+        self._current_attack_path = None  # e.g. "regex_bypass", "rce", "file_inclusion"
+        self._same_path_fail_count = 0
+        self._path_switch_forced = False
+
+        # ★ Assumption tracking: help the LLM verify its assumptions
+        self._unverified_assumptions = []  # assumptions noted by the agent
+
+        # ★ Detect CTF mode — when user explicitly asks for flag/CTF,
+        # we enforce strict termination: must have verified flag to stop
+        ctf_keywords = ["ctf", "flag", "夺旗", "解题", "找flag", "找出flag"]
+        self._is_ctf_mode = any(kw in user_input.lower() for kw in ctf_keywords)
 
         # ── Autonomous loop ─────────────────────────────────────────
         for round_num in range(1, max_rounds + 1):
@@ -336,11 +392,35 @@ class AgentCore:
                 # If notes contain "验证成功" or similar, mark flag as verified
                 if hasattr(self, '_claimed_flag') and self._claimed_flag and not getattr(self, '_flag_verified', False):
                     verification_markers = [
+                        # 显式验证表达
                         "验证成功", "验证通过", "已验证", "复现成功", "确认flag",
-                        "verified", "confirmed",
+                        "verified", "confirmed", "flag正确", "提交成功",
+                        # LLM 实际常用的表达方式
+                        "flag 获取成功", "flag获取成功", "获取成功", "找到flag",
+                        "flag found", "成功获取", "获取了flag", "拿到了flag",
+                        "成功拿到", "成功找到", "解题完成", "解题成功",
                     ]
                     if any(m in response_text.lower() for m in verification_markers):
                         self._flag_verified = True
+
+                # ★ CTF mode: also auto-verify if the claimed flag appears in tool results
+                # This handles cases where the LLM extracts the flag from a tool response
+                # but doesn't explicitly say "验证成功"
+                if getattr(self, '_is_ctf_mode', False) and self._claimed_flag and not getattr(self, '_flag_verified', False):
+                    # Method 1: Check if the flag appears in notes (from real tool output)
+                    flag_in_notes_count = sum(
+                        1 for note in self.context.state.notes
+                        if self._claimed_flag in note
+                    )
+                    # If flag appears in notes ≥ 2 times from different tool calls,
+                    # it's been independently confirmed
+                    if flag_in_notes_count >= 2:
+                        self._flag_verified = True
+                    elif flag_in_notes_count >= 1:
+                        # Flag appears once in notes — check if LLM also claimed it
+                        # (which means both tool output and LLM analysis agree)
+                        if self._claimed_flag in response_text:
+                            self._flag_verified = True
 
                 # Detect phase transitions from LLM output
                 new_phase = self._detect_phase_from_output(response_text)
@@ -351,20 +431,93 @@ class AgentCore:
                 # Check if agent signals completion
                 result.should_continue = not self._is_completion_signal(response_text)
 
-                # ★ Flag verification tracking — detect unverified flag claims
+                # ★ Flag verification tracking — detect flag claims in LLM output
                 claimed_flag = self._detect_flag_claim(response_text)
                 if claimed_flag:
-                    if not hasattr(self, '_claimed_flag'):
+                    if not hasattr(self, '_claimed_flag') or not self._claimed_flag:
+                        # First time flag is claimed — record it, force one verification round
                         self._claimed_flag = claimed_flag
                         self._flag_verified = False
-                        # Don't stop on first flag claim — force verification round
                         result.should_continue = True
-                    elif self._claimed_flag == claimed_flag and hasattr(self, '_flag_verified') and not self._flag_verified:
-                        # Same flag claimed again without verification — keep going
+                    elif self._claimed_flag == claimed_flag and not getattr(self, '_flag_verified', False):
+                        # Same flag claimed again but not yet verified — keep going
+                        # BUT: add a safety cap — if this is the 3rd+ time the same
+                        # unverified flag appears, auto-verify to avoid infinite loop
+                        if not hasattr(self, '_flag_claim_count'):
+                            self._flag_claim_count = 0
+                        self._flag_claim_count += 1
+                        if self._flag_claim_count >= 3:
+                            # Same flag claimed 3+ times — likely genuine, auto-verify
+                            self._flag_verified = True
+                        else:
+                            result.should_continue = True
+
+                # ★ CTF mode: block [DONE] if no verified flag
+                # In CTF, the only valid completion is getting and verifying the flag.
+                # LLM might say [DONE] prematurely (e.g. "found the file with the flag"
+                # but never actually extracted the flag value).
+                if getattr(self, '_is_ctf_mode', False) and not result.should_continue:
+                    flag_verified = getattr(self, '_flag_verified', False)
+                    claimed_flag = getattr(self, '_claimed_flag', None)
+                    if not flag_verified or not claimed_flag:
+                        # Block termination — force continue
                         result.should_continue = True
+                    # ★ IMPORTANT: if flag IS verified and LLM says [DONE], LET IT STOP
+                    # This is the key fix — previously _flag_verified never became True,
+                    # so the agent kept looping even after successful flag verification
+
+                # ★ Post-flag safety exit: if flag is verified, allow [DONE] to stop the loop
+                # Also: if the LLM keeps repeating the same verified flag + [DONE],
+                # force-stop after 2 rounds to avoid the "celebration loop" problem
+                if getattr(self, '_flag_verified', False) and getattr(self, '_claimed_flag', None):
+                    if not hasattr(self, '_post_flag_rounds'):
+                        self._post_flag_rounds = 0
+                    self._post_flag_rounds += 1
+                    # After flag is verified, allow at most 2 more rounds for summary,
+                    # then force-stop regardless
+                    if self._post_flag_rounds >= 2:
+                        result.should_continue = False
 
                 # Record step
                 self.context.state.add_step(f"Round {round_num}: {response_text[:100]}...")
+
+                # ★ Dead-loop detection: check if we're making progress
+                current_findings = len(self.context.state.findings)
+                current_notes = len(self.context.state.notes)
+                current_steps = len(self.context.state.executed_steps)
+                
+                has_new_progress = (
+                    current_findings > self._last_findings_count
+                    or current_notes > self._last_notes_count
+                    or current_steps > self._last_steps_count + 1  # +1 because we just added a step
+                )
+                
+                if has_new_progress:
+                    self._rounds_without_progress = 0
+                else:
+                    self._rounds_without_progress += 1
+                
+                self._last_findings_count = current_findings
+                self._last_notes_count = current_notes
+                self._last_steps_count = current_steps
+
+                # ★ Attack path tracking: detect if we're stuck on the same approach
+                # by checking the LLM output for repeated keywords/techniques
+                if not has_new_progress and not getattr(self, '_path_switch_forced', False):
+                    # Extract the attack technique from this round's output
+                    detected_path = self._detect_attack_path(response_text)
+                    if detected_path:
+                        if detected_path == getattr(self, '_current_attack_path', None):
+                            self._same_path_fail_count += 1
+                        else:
+                            # New path — reset counter
+                            self._current_attack_path = detected_path
+                            self._same_path_fail_count = 0
+                            self._path_switch_forced = False
+                elif has_new_progress:
+                    # Progress made — reset path tracking
+                    self._same_path_fail_count = 0
+                    self._path_switch_forced = False
 
                 # Auto-save
                 self.context.state.save()
@@ -410,10 +563,28 @@ class AgentCore:
         steps_summary = ""
         if state.executed_steps:
             # Show recent steps in more detail
-            recent_steps = state.executed_steps[-5:]
+            recent_steps = state.executed_steps[-8:]
             steps_summary = f"\n最近执行步骤: {len(state.executed_steps)} 个总计"
             for s in recent_steps:
                 steps_summary += f"\n  - {s[:150]}"
+
+        # ★ Failed attempts tracking — critical for CTF to avoid repeating mistakes
+        failed_summary = ""
+        if state.executed_steps:
+            failed_attempts = []
+            failure_markers = [
+                "失败", "没有", "返回相同", "被拦截", "404", "no",
+                "未成功", "无效", "error", "failed", "still",
+                "未发现", "无结果", "timeout", "禁止", "denied",
+                "不存在", "无法", "不能", "不对",
+            ]
+            for step in state.executed_steps:
+                if any(marker in step.lower() for marker in failure_markers):
+                    failed_attempts.append(step[:150])
+            if failed_attempts:
+                failed_summary = f"\n失败历史（不要重复这些操作）:"
+                for f in failed_attempts[-10:]:  # Keep last 10 failures
+                    failed_summary += f"\n  ❌ {f}"
 
         recon_summary = ""
         if state.recon_data:
@@ -424,11 +595,102 @@ class AgentCore:
         if state.notes:
             notes_summary = f"\n重要笔记: {'; '.join(state.notes[-5:])}"
 
+        # ★ Confirmed facts vs unverified assumptions — critical for reasoning quality
+        facts_summary = ""
+        if hasattr(state, 'confirmed_facts') and state.confirmed_facts:
+            facts_summary = f"\n已确认事实（工具验证过，可信）:"
+            for fact in state.confirmed_facts[-8:]:
+                facts_summary += f"\n  ✅ {fact[:150]}"
+
+        assumptions_summary = ""
+        if hasattr(state, 'unverified_assumptions') and state.unverified_assumptions:
+            assumptions_summary = f"\n⚠️ 未验证假设（推理基础但未确认，可能错误）:"
+            for assumption in state.unverified_assumptions[-5:]:
+                assumptions_summary += f"\n  ❓ {assumption[:150]}"
+            assumptions_summary += "\n→ 如果某条假设是错的，基于它的推理全部作废！优先验证关键假设。"
+
+        # ★ Path switch warning — if stuck on same approach for too long
+        path_warning = ""
+        same_path_fails = getattr(self, '_same_path_fail_count', 0)
+        if state.executed_steps:
+            recent = state.executed_steps[-8:]
+            if len(recent) >= 5:
+                # Check if recent steps all mention the same parameter/technique
+                # Simple heuristic: if the last 5 steps share common substrings
+                recent_text = " ".join(recent).lower()
+                stuck_indicators = ["get=", "post=", "payload", "参数", "尝试"]
+                stuck_count = sum(1 for ind in stuck_indicators if recent_text.count(ind) >= 3)
+                if stuck_count >= 1:
+                    path_warning = (
+                        "\n\n⚠️ 你已经在当前路径上尝试了多轮但没有突破。"
+                        "\n请重新审视源码/信息，是否有其他更简单的利用路径？"
+                        "\n列出所有可能的路径，然后切换到最简单的一条。"
+                    )
+
+        # ★ Attack path stuck warning — if same path fails 3+ times, force path switch
+        path_switch_warning = ""
+        if same_path_fails >= 3:
+            path_switch_warning = (
+                f"\n\n🔴 路径切换强制指令：你已经在同一条攻击路径上失败了 {same_path_fails} 次！"
+                f"\n你必须立即执行以下步骤："
+                f"\n1. 停下来，列出至少 3 条**完全不同**的替代攻击路径"
+                f"\n   （不是换 payload 值，而是换攻击方式：如从'绕过正则'换成'伪协议读文件'或'数组绕过'）"
+                f"\n2. 按难度从低到高排序这些替代路径"
+                f"\n3. 选择最简单的替代路径开始尝试"
+                f"\n4. 在尝试新路径前，先花 1 轮验证你的新假设"
+                f"\n\n⚠️ 禁止继续在同一路径上换 payload 值尝试！"
+            )
+            # Reset the counter to avoid repeating the warning forever
+            self._same_path_fail_count = 0
+            self._path_switch_forced = True
+
+        # ★ Assumption verification reminder — remind LLM to verify assumptions
+        assumption_reminder = ""
+        if round_num > 2 and round_num % 3 == 0:
+            assumption_reminder = (
+                "\n\n🧠 假设验证检查点："
+                "\n在做下一步之前，花 10 秒问自己："
+                "\n1. 我当前的推理基于什么假设？"
+                "\n2. 这些假设我验证过了吗？还是只是在想当然？"
+                "\n3. 如果某个假设是错的，我的整个推理链会崩塌吗？"
+                "\n4. 我能花 1 轮发送一个请求来验证最关键的假设吗？"
+                "\n\n❌ 常见致命假设：preg_replace 只替换第一个匹配 / Python 模拟 = 服务器行为 / 参数名是某个值"
+            )
+
+        # ★ Dead-loop detection — if no progress for multiple rounds
+        dead_loop_warning = ""
+        rounds_no_progress = getattr(self, '_rounds_without_progress', 0)
+        stale_threshold = self.config.session.stale_rounds_threshold
+        if rounds_no_progress >= stale_threshold:
+            dead_loop_warning = (
+                f"\n\n🔴 严重警告：你已经连续 {rounds_no_progress} 轮没有任何新发现！"
+                f"\n这表明你陷入了死循环。你必须立即采取以下措施之一："
+                f"\n1. 🔥 重新获取完整源码（用 python_execute + strip_tags）"
+                f"\n2. 🔥 尝试完全不同的攻击路径（换参数名、换方法、换工具）"
+                f"\n3. 🔥 如果当前信息不足，承认并尝试其他信息收集方法"
+                f"\n4. 🔥 停止重复相同操作！回顾失败历史，选择新方向"
+                f"\n\n⚠️ 再次重复相同操作将不会产生不同结果！"
+            )
+        elif rounds_no_progress >= max(stale_threshold // 2, 2):
+            dead_loop_warning = (
+                f"\n\n⚠️ 警告：你已经连续 {rounds_no_progress} 轮没有新发现。"
+                f"\n请检查：是否在重复相同操作？是否有其他未尝试的路径？"
+                f"\n如果当前方法不work，立即切换到其他方法。"
+            )
+
         # Flag verification warning — if a flag was claimed but not verified
         flag_warning = ""
         claimed_flag = getattr(self, '_claimed_flag', None)
         flag_verified = getattr(self, '_flag_verified', False)
-        if claimed_flag and not flag_verified:
+        post_flag_rounds = getattr(self, '_post_flag_rounds', 0)
+        if claimed_flag and flag_verified:
+            # Flag is verified — tell the LLM to wrap up
+            flag_warning = (
+                f"\n\n✅ FLAG 已验证: {claimed_flag}"
+                f"\n你的任务已完成！请简洁总结解题过程，然后标记 [DONE] 结束。"
+                f"\n⚠️ 不要重复验证或重复发送请求！立即总结并结束。"
+            )
+        elif claimed_flag and not flag_verified:
             flag_warning = (
                 f"\n\n⚠️ 你之前声称找到了 flag: {claimed_flag}"
                 f"\n但这个 flag 未经独立验证！你必须："
@@ -438,19 +700,209 @@ class AgentCore:
                 f"\n在验证完成前，不要标记 [DONE]"
             )
 
+        # ★ CTF mode: enforce no early termination without flag
+        ctf_mode_warning = ""
+        is_ctf = getattr(self, '_is_ctf_mode', False)
+        if is_ctf and not claimed_flag:
+            ctf_mode_warning = (
+                f"\n\n🔴 CTF 解题模式 — 你的任务是找到 flag 并验证。"
+                f"\n当前你还没有找到任何 flag，禁止标记 [DONE]。"
+                f"\n请分析已有信息，选择最有可能的攻击路径继续推进。"
+                f"\n如果当前路径受阻，尝试切换到其他路径。"
+            )
+        elif is_ctf and claimed_flag and not flag_verified:
+            ctf_mode_warning = (
+                f"\n\n🔴 CTF 解题模式 — 你声称找到了 flag 但未验证。"
+                f"\n必须用工具验证 flag 的真实性后才能标记 [DONE]。"
+                f"\n如果验证失败，必须继续寻找正确的 flag。"
+            )
+        elif is_ctf and claimed_flag and flag_verified:
+            # Flag verified — no need for CTF warning, flag_warning already handles it
+            pass
+
         return (
             f"\n\n[自主循环 Round {round_num}/{max_rounds}]"
             f"\n当前目标: {state.target or '未设置'}"
             f"\n当前阶段: {state.phase.value}"
             f"{findings_summary}"
+            f"{facts_summary}"
+            f"{assumptions_summary}"
             f"{steps_summary}"
+            f"{failed_summary}"
             f"{recon_summary}"
             f"{notes_summary}"
+            f"{path_warning}"
+            f"{path_switch_warning}"
+            f"{assumption_reminder}"
+            f"{dead_loop_warning}"
             f"{flag_warning}"
+            f"{ctf_mode_warning}"
             f"\n\n请基于当前状态和之前所有发现决定下一步操作，持续推进渗透测试。"
             f"\n注意：不要重复之前已经做过的操作，专注于推进到下一步。"
             f"\n如果发现重要线索或完成测试，在回复末尾添加 [DONE] 标记。"
         )
+
+    # ── Persistent pentest loop ──────────────────────────────────────
+
+    async def persistent_pentest(
+        self,
+        user_input: str,
+        target: Optional[str] = None,
+        rounds_per_cycle: int = 100,
+        max_cycles: int = 10,
+        auto_report: bool = True,
+        on_cycle_step: Optional[Callable[[int, int, AgentResult], None]] = None,
+        on_cycle_complete: Optional[Callable[[int, "PersistentCycleResult"], None]] = None,
+    ) -> list["PersistentCycleResult"]:
+        """Persistent penetration test — runs cycles of auto_pentest until stopped.
+
+        Each cycle runs up to `rounds_per_cycle` rounds. After each cycle:
+        - A cycle report is auto-generated (if auto_report=True)
+        - The session state is preserved across cycles for continuity
+        - The next cycle continues from where the previous left off
+
+        The loop continues until:
+        - max_cycles is reached (default 10, set 0 for unlimited)
+        - User interrupts via Ctrl+C
+        - The agent signals completion with [DONE] and no new findings
+
+        Args:
+            user_input: The user's initial request (e.g. "对 xxx 进行持续性渗透测试")
+            target: Optional explicit target override
+            rounds_per_cycle: Number of rounds per cycle (default 100)
+            max_cycles: Maximum number of cycles (default 10, 0=unlimited)
+            auto_report: Auto-generate report after each cycle
+            on_cycle_step: Callback(round_num, cycle_num, result) for each step
+            on_cycle_complete: Callback(cycle_num, cycle_result) after each cycle
+
+        Returns:
+            List of PersistentCycleResult for each completed cycle.
+        """
+        cycle_results: list[PersistentCycleResult] = []
+
+        # ── Cycle 0: Initial setup ──────────────────────────────────
+        detected_target = target or self._detect_target(user_input)
+        if detected_target:
+            self.context.state.target = detected_target
+
+        # Add user's initial request to context
+        self.context.add_user_message(user_input)
+
+        # Store initial skill dispatch
+        self._auto_skill_input = user_input
+
+        # Reset flag verification state for this run
+        self._claimed_flag = None
+        self._flag_verified = False
+        self._flag_claim_count = 0
+        self._post_flag_rounds = 0
+
+        # ★ Dead-loop detection for persistent mode too
+        self._rounds_without_progress = 0
+        self._last_findings_count = 0
+        self._last_notes_count = 0
+        self._last_steps_count = 0
+
+        # ★ Attack path tracking for persistent mode
+        self._current_attack_path = None
+        self._same_path_fail_count = 0
+        self._path_switch_forced = False
+
+        # ★ Detect CTF mode for persistent pentest too
+        ctf_keywords = ["ctf", "flag", "夺旗", "解题", "找flag", "找出flag"]
+        self._is_ctf_mode = any(kw in user_input.lower() for kw in ctf_keywords)
+
+        # Track cumulative findings across cycles for delta detection
+        findings_at_cycle_start = len(self.context.state.findings)
+
+        # ── Persistent cycle loop ─────────────────────────────────────
+        cycle_num = 0
+        should_stop = False
+
+        while not should_stop:
+            cycle_num += 1
+
+            # Check hard limit
+            if max_cycles > 0 and cycle_num > max_cycles:
+                should_stop = True
+                break
+
+            # Run one cycle of auto_pentest
+            cycle_results_list: list[AgentResult] = []
+
+            def _make_step_callback(cycle: int):
+                """Create a step callback that captures cycle number."""
+                def _on_step(round_num: int, result: AgentResult) -> None:
+                    cycle_results_list.append(result)
+                    if on_cycle_step:
+                        on_cycle_step(round_num, cycle, result)
+                return _on_step
+
+            try:
+                results = await self.auto_pentest(
+                    user_input=(
+                        f"[Persistent Cycle {cycle_num}] 继续对目标 {self.context.state.target or '未知'} "
+                        f"进行渗透测试。这是第 {cycle_num} 个周期，保持之前的所有发现继续深入。"
+                        if cycle_num > 1 else user_input
+                    ),
+                    target=self.context.state.target,
+                    max_rounds=rounds_per_cycle,
+                    on_step=_make_step_callback(cycle_num),
+                )
+                cycle_results_list = results if results else cycle_results_list
+            except KeyboardInterrupt:
+                # User interrupted during the cycle
+                should_stop = True
+                cycle_results_list = cycle_results_list or []
+
+            # Compute cycle stats
+            total_findings = len(self.context.state.findings)
+            total_steps = len(self.context.state.executed_steps)
+            new_findings = total_findings - findings_at_cycle_start
+            findings_at_cycle_start = total_findings
+
+            # Generate cycle report
+            report_path = None
+            if auto_report:
+                try:
+                    from vulnclaw.report.generator import generate_persistent_cycle_report
+                    report_path = generate_persistent_cycle_report(
+                        session=self.context.state,
+                        cycle_num=cycle_num,
+                        total_findings=total_findings,
+                        new_findings=new_findings,
+                        total_steps=total_steps,
+                        rounds_per_cycle=rounds_per_cycle,
+                    )
+                except Exception as e:
+                    report_path = f"报告生成失败: {e}"
+
+            # Build cycle result
+            cycle_result = PersistentCycleResult(
+                cycle_num=cycle_num,
+                results=cycle_results_list,
+                report_path=str(report_path) if report_path else None,
+                total_findings=total_findings,
+                total_steps=total_steps,
+                stopped_early=should_stop,
+            )
+            cycle_results.append(cycle_result)
+
+            # Notify via callback
+            if on_cycle_complete:
+                on_cycle_complete(cycle_num, cycle_result)
+
+            # Check if the agent signaled completion in the last cycle
+            if cycle_results_list and not should_stop:
+                last_result = cycle_results_list[-1]
+                if not last_result.should_continue:
+                    # Agent said it's done — but in persistent mode, we continue
+                    # unless there are truly no new findings
+                    if new_findings == 0 and total_findings > 0:
+                        # No new findings and agent says done — meaningful completion
+                        should_stop = True
+
+        return cycle_results
 
     def _detect_phase_from_output(self, output: str) -> Optional[PentestPhase]:
         """Detect phase transition signals from LLM output."""
@@ -501,6 +953,65 @@ class AgentCore:
                 return match.group(1)
         return None
 
+    def _detect_attack_path(self, output: str) -> Optional[str]:
+        """Detect the current attack path/technique from LLM output.
+
+        Returns a canonical path name like "regex_bypass", "rce", "file_inclusion", etc.
+        Used to track whether the agent is stuck on the same approach.
+        """
+        output_lower = output.lower()
+
+        # Attack path patterns — ordered by specificity (more specific first)
+        path_patterns = [
+            ("regex_bypass", ["preg_replace", "preg_match", "正则绕过", "大小写绕过", "数组绕过", "双写绕过"]),
+            ("file_inclusion", ["php://filter", "文件包含", "include", "require", "伪协议", "php://input", "data://"]),
+            ("rce", ["eval(", "system(", "exec(", "passthru(", "shell_exec(", "命令执行", "rce"]),
+            ("sqli", ["sql注入", "union select", "information_schema", "sqli", "sqlmap"]),
+            ("ssti", ["ssti", "template", "jinja2", "twig", "{{", "模板注入"]),
+            ("deserialization", ["反序列化", "unserialize", "serialize", "pop链", "wakeup"]),
+            ("file_upload", ["文件上传", "upload", "webshell", "一句话木马"]),
+            ("ssrf", ["ssrf", "gopher://", "dict://", "内网访问"]),
+            ("xxe", ["xxe", "xml外部实体", "ENTITY"]),
+            ("info_leak", ["源码泄露", ".git", ".svn", "备份文件", "目录遍历", "robots.txt"]),
+            ("brute_force", ["爆破", "弱口令", "字典", "brute"]),
+        ]
+
+        for path_name, keywords in path_patterns:
+            if any(kw in output_lower for kw in keywords):
+                return path_name
+
+        return None
+
+    # ── Response extraction ──────────────────────────────
+
+    @staticmethod
+    def _extract_response(message) -> str:
+        """Extract the actual response text from an LLM message.
+        
+        Handles:
+        1. Normal content (no thinking)
+        2. Content with inline <thinking> tags (open/closed)
+        3. Separate reasoning_content field (DeepSeek R1, etc.)
+        
+        Returns the response text with thinking tags preserved for
+        later processing by format_think_tags/strip_think_tags.
+        """
+        content = message.content or ""
+        
+        # Check for separate reasoning_content field (DeepSeek R1, etc.)
+        # Some providers return thinking in reasoning_content, separate from content
+        reasoning = getattr(message, "reasoning_content", None) or ""
+        if reasoning and not content:
+            # Model put all thinking in reasoning_content, content is empty
+            # Prepend thinking as a <thinking> block so format_think_tags can handle it
+            content = f"<thinking>\n{reasoning}\n</thinking>\n"
+        elif reasoning and content:
+            # Model has both reasoning and content
+            # Prepend reasoning as a <thinking> block
+            content = f"<thinking>\n{reasoning}\n</thinking>\n{content}"
+        
+        return content
+
     # ── LLM call methods ────────────────────────────────────────────
 
     async def _call_llm(self, system_prompt: str) -> str:
@@ -543,7 +1054,7 @@ class AgentCore:
         if choice.message.tool_calls:
             return await self._handle_tool_calls(choice.message)
 
-        return choice.message.content or ""
+        return self._extract_response(choice.message)
 
     async def _call_llm_auto(self, system_prompt: str, round_context: str) -> str:
         """Call the LLM in auto-pentest mode with round context appended.
@@ -627,7 +1138,11 @@ class AgentCore:
             for tc in choice.message.tool_calls:
                 tool_summary_parts.append(f"调用工具: {tc.function.name}({tc.function.arguments[:200]})")
             for tr in tool_results:
-                tool_summary_parts.append(f"工具结果: {tr['content'][:500]}")
+                content = tr['content']
+                # ★ Improved truncation: keep head + tail (flag usually at the end)
+                if len(content) > 1000:
+                    content = content[:500] + "\n...[中间省略]...\n" + content[-500:]
+                tool_summary_parts.append(f"工具结果: {content}")
             self.context.add_assistant_message(" | ".join(tool_summary_parts))
 
             # Second LLM call with tool results
@@ -637,7 +1152,7 @@ class AgentCore:
                     None,
                     lambda: client.chat.completions.create(**kwargs),
                 )
-                final_text = response2.choices[0].message.content or ""
+                final_text = self._extract_response(response2.choices[0].message)
                 # Persist the follow-up LLM response too
                 self.context.add_assistant_message(final_text)
                 return final_text
@@ -645,7 +1160,7 @@ class AgentCore:
                 # If the follow-up call fails, return what we have
                 return f"[tool results processed] 继续分析错误: {e2}"
 
-        return choice.message.content or ""
+        return self._extract_response(choice.message)
 
     async def _handle_tool_calls(self, message) -> str:
         """Handle tool calls from the LLM response (legacy single-turn)."""
@@ -709,6 +1224,10 @@ class AgentCore:
 
     async def _execute_mcp_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool call via MCP manager or built-in tools."""
+        # Built-in Python code executor
+        if tool_name == "python_execute":
+            return await self._execute_python(args)
+
         # Built-in skill reference loader
         if tool_name == "load_skill_reference":
             try:
@@ -768,7 +1287,7 @@ class AgentCore:
                     "properties": {
                         "skill_name": {
                             "type": "string",
-                            "description": "Skill 名称，如 client-reverse, web-security-advanced, ai-mcp-security, intranet-pentest-advanced, pentest-tools, rapid-checklist, crypto-toolkit",
+                            "description": "Skill 名称，如 client-reverse, web-security-advanced, ai-mcp-security, intranet-pentest-advanced, pentest-tools, rapid-checklist, crypto-toolkit, ctf-web, ctf-crypto, ctf-misc",
                         },
                         "reference_name": {
                             "type": "string",
@@ -776,6 +1295,35 @@ class AgentCore:
                         },
                     },
                     "required": ["skill_name", "reference_name"],
+                },
+            },
+        })
+
+        # Built-in Python code executor
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "python_execute",
+                "description": (
+                    "执行 Python 代码片段。用于：构造复杂 HTTP 请求并解析响应、"
+                    "做编码转换和数据处理、批量测试不同 payload、比较响应差异、"
+                    "执行数学计算等。代码在受限环境中执行，超时 30 秒。"
+                    "预装库：requests, beautifulsoup4, pycryptodome, base64, json, re 等。"
+                    "重要：构造 HTTP 请求时请使用此工具而非猜测响应内容。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "要执行的 Python 代码。支持多行，可 import 标准库和 requests/bs4 等。",
+                        },
+                        "purpose": {
+                            "type": "string",
+                            "description": "简要说明执行目的（用于审计日志），如'构造HTTP请求测试弱比较绕过'",
+                        },
+                    },
+                    "required": ["code"],
                 },
             },
         })
@@ -854,6 +1402,120 @@ class AgentCore:
 
         return tools
 
+    # ── Python code executor ─────────────────────────────────────────
+
+    # Blocked patterns for sandbox safety
+    _BLOCKED_PATTERNS = [
+        r"os\.\s*system\s*\(",
+        r"subprocess\.\s*Popen\s*\(",
+        r"shutil\.\s*rmtree\s*\(",
+        r"__import__\s*\(\s*['\"]os['\"]",
+        r"open\s*\(\s*['\"].*vulnclaw.*config",
+        r"open\s*\(\s*['\"].*\.vulnclaw",
+    ]
+
+    async def _execute_python(self, args: dict) -> str:
+        """Execute a Python code snippet in a sandboxed subprocess.
+
+        The code runs with a 30-second timeout. stdout and stderr are
+        captured and returned to the LLM.
+        """
+        code = args.get("code", "")
+        purpose = args.get("purpose", "")
+
+        if not code.strip():
+            return "[!] 代码为空，未执行"
+
+        # Sandbox safety: block dangerous patterns
+        for pattern in self._BLOCKED_PATTERNS:
+            if re.search(pattern, code):
+                return f"[!] 代码包含被禁止的操作模式: {pattern}，出于安全原因拒绝执行"
+
+        # Write code to a temp file and execute it
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, encoding="utf-8"
+            ) as f:
+                # Prepend common imports for convenience
+                preamble = (
+                    "import sys, json, re, os, base64, hashlib, itertools, "
+                    "collections, datetime, struct, binascii, textwrap\n"
+                    "try:\n"
+                    "    import requests\n"
+                    "except ImportError:\n"
+                    "    pass\n"
+                    "try:\n"
+                    "    from bs4 import BeautifulSoup\n"
+                    "except ImportError:\n"
+                    "    pass\n"
+                    "try:\n"
+                    "    from Crypto.Cipher import AES\n"
+                    "except ImportError:\n"
+                    "    pass\n"
+                    "\n"
+                )
+                f.write(preamble)
+                f.write(code)
+                tmp_path = f.name
+
+            # Execute with timeout
+            import asyncio
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [sys.executable, tmp_path],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=30,
+                    cwd=tempfile.gettempdir(),
+                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+                ),
+            )
+
+            # Clean up temp file
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+            output_parts = []
+            if result.stdout:
+                output_parts.append(result.stdout)
+            if result.stderr:
+                # Filter out import warnings
+                stderr_lines = [
+                    line for line in result.stderr.splitlines()
+                    if "ImportError" not in line and "No module named" not in line
+                ]
+                if stderr_lines:
+                    output_parts.append("[stderr]\n" + "\n".join(stderr_lines))
+
+            if not output_parts:
+                return "[✓] 代码执行成功，无输出"
+
+            output = "\n".join(output_parts)
+            # Truncate if too long
+            if len(output) > 8000:
+                output = output[:4000] + "\n...[中间省略]...\n" + output[-4000:]
+
+            return f"[✓] Python 执行结果:\n{output}"
+
+        except subprocess.TimeoutExpired:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return "[!] Python 执行超时（30秒），请简化代码或分步执行"
+        except Exception as e:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return f"[!] Python 执行错误: {e}"
+
     def _parse_findings(self, response: str) -> None:
         """Parse vulnerability findings and key discoveries from LLM response."""
         from vulnclaw.agent.context import VulnerabilityFinding
@@ -889,3 +1551,29 @@ class AgentCore:
                 # Avoid duplicate notes
                 if note and note not in self.context.state.notes:
                     self.context.state.add_note(note)
+
+        # ★ Auto-extract confirmed facts (verified by tool output)
+        confirmed_markers = [
+            r'已确认[：:]\s*(.+?)(?:\n|$)',
+            r'确认[：:]\s*(.+?)(?:\n|$)',
+            r'验证成功[：:]\s*(.+?)(?:\n|$)',
+            r'\[✅\]\s*(.+?)(?:\n|$)',
+        ]
+        for pattern in confirmed_markers:
+            matches = re.findall(pattern, response, re.IGNORECASE)
+            for match in matches:
+                fact = match.strip()[:200]
+                if fact and hasattr(self.context.state, 'add_confirmed_fact'):
+                    self.context.state.add_confirmed_fact(fact)
+
+        # ★ Auto-extract unverified assumptions from LLM output
+        assumption_markers = [
+            r'假设[：:]\s*(.+?)(?:\n|$)',
+            r'推测[：:]\s*(.+?)(?:\n|$)',
+        ]
+        for pattern in assumption_markers:
+            matches = re.findall(pattern, response, re.IGNORECASE)
+            for match in matches:
+                assumption = match.strip()[:200]
+                if assumption and hasattr(self.context.state, 'add_assumption'):
+                    self.context.state.add_assumption(assumption)

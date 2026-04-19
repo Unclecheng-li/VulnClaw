@@ -45,6 +45,9 @@ class SessionState(BaseModel):
     recon_data: dict[str, Any] = Field(default_factory=dict)
     executed_steps: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+    # ★ Confirmed facts vs unverified assumptions — critical for CTF reasoning
+    confirmed_facts: list[str] = Field(default_factory=list, description="已通过工具验证确认的事实")
+    unverified_assumptions: list[str] = Field(default_factory=list, description="推理中基于但未验证的假设")
 
     def add_finding(self, finding: VulnerabilityFinding) -> None:
         """Add a vulnerability finding."""
@@ -57,6 +60,16 @@ class SessionState(BaseModel):
     def add_note(self, note: str) -> None:
         """Add a session note."""
         self.notes.append(note)
+
+    def add_confirmed_fact(self, fact: str) -> None:
+        """Add a confirmed fact (verified by tool output)."""
+        if fact and fact not in self.confirmed_facts:
+            self.confirmed_facts.append(fact)
+
+    def add_assumption(self, assumption: str) -> None:
+        """Add an unverified assumption."""
+        if assumption and assumption not in self.unverified_assumptions:
+            self.unverified_assumptions.append(assumption)
 
     def advance_phase(self, phase: PentestPhase) -> None:
         """Move to a new phase."""
@@ -160,9 +173,16 @@ class ContextManager:
             for line in content.split("\n"):
                 stripped = line.strip()
                 if any(marker in stripped for marker in [
-                    "[+]", "[!]", "发现", "漏洞", "flag", "CVE",
+                    "[+]", "[!]", "[-]", "发现", "漏洞", "flag", "CVE",
                     "端口", "开放", "服务", "路径", "泄露", "注入",
                     "Status:", "Headers:", "Body",
+                    # ★ Negative/failure markers — critical for CTF to avoid repeating
+                    "失败", "无效", "没有", "返回相同", "被拦截",
+                    "未成功", "不存在", "错误", "404", "timeout",
+                    # ★ Confirmed fact markers — verified by actual tool output
+                    "已确认", "确认", "验证成功", "verified", "confirmed",
+                    # ★ Assumption markers — things the LLM assumed but didn't verify
+                    "假设", "应该", "可能", "推测", "猜测", "估计",
                 ]):
                     key_parts.append(stripped[:200])
 

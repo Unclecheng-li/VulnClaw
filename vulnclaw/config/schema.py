@@ -124,6 +124,15 @@ class SessionConfig(BaseModel):
     poc_language: str = Field(default="python", description="Default PoC language: python, bash")
     max_rounds: int = Field(default=15, description="Max autonomous pentest rounds (1-100)")
     show_thinking: bool = Field(default=False, description="Show LLM thinking/reasoning output (default: off)")
+    # Dead-loop detection
+    stale_rounds_threshold: int = Field(
+        default=5,
+        description="Consecutive rounds without progress before dead-loop warning (1-50)",
+    )
+    # Persistent pentest configuration
+    persistent_rounds_per_cycle: int = Field(default=100, description="Rounds per persistent pentest cycle")
+    persistent_max_cycles: int = Field(default=10, description="Max cycles for persistent pentest (0=unlimited)")
+    persistent_auto_report: bool = Field(default=True, description="Auto-generate report after each cycle")
 
 
 class VulnClawConfig(BaseModel):

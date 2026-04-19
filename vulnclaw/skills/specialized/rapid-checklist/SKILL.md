@@ -20,6 +20,19 @@ description: 渗透速查与Payload — 快速Payload家族、绕过提醒、验
 - 替代方法论决策 → 用对应专项 Skill
 - 请求未抓到、重放未稳定时盲测 → 先用 `client-reverse`
 
+## CTF 专项速查
+
+> CTF 题目优先用 `ctf-web` / `ctf-crypto` / `ctf-misc` Skill，以下为快速卡片：
+
+| 场景 | 快速定位 |
+|------|---------|
+| PHP 弱比较 → 0e 开头 MD5 值 | `ctf-web` → `php-bypass-cheatsheet.md` |
+| 命令注入空格绕过 → ${IFS}/$IFS$9/< | `ctf-web` → `command-injection-bypass.md` |
+| eval 无回显 → 写文件/DNS 外带 | `ctf-web` → `eval-and-rce-techniques.md` |
+| RSA 小指数 → 立方根/Coppersmith | `ctf-crypto` → `rsa-attacks-cheatsheet.md` |
+| Python Jail → `__import__`/func_globals | `ctf-misc` → `python-jail-escape.md` |
+| 编码链 → base64→hex→ROT13 多层 | `ctf-misc` → `encoding-chain-reference.md` |
+
 ## 快速路由卡片
 
 ### Web 注入 / 输出执行
