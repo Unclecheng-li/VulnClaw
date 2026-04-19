@@ -12,6 +12,37 @@ from vulnclaw.agent.context import ContextManager, PentestPhase, SessionState
 from vulnclaw.agent.prompts import build_system_prompt, AUTO_PENTEST_INSTRUCTION
 
 
+# ── Think tag filtering ─────────────────────────────────────────────
+
+_THINK_PATTERN = re.compile(
+    r"<(?:think|thinking)>.*?</(?:think|thinking)>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_think_tags(text: str) -> str:
+    """Remove all <think>...</think> and <thinking>...</thinking> blocks from text."""
+    return _THINK_PATTERN.sub("", text).strip()
+
+
+def format_think_tags(text: str, show: bool) -> str:
+    """Format output based on show_thinking setting.
+
+    If show=True:  keep think tags but dim them with Rich markup.
+    If show=False: strip think tags entirely.
+    """
+    if show:
+        # Dim the think content but keep it visible
+        def _dim_think(match: re.Match) -> str:
+            content = match.group(0)
+            # Extract inner content
+            inner = re.sub(r"^<(?:think|thinking)>", "", content, flags=re.IGNORECASE)
+            inner = re.sub(r"</(?:think|thinking)>$", "", inner, flags=re.IGNORECASE)
+            return f"[dim]<think>{inner}[/dim]"
+        return _THINK_PATTERN.sub(_dim_think, text)
+    return strip_think_tags(text)
+
+
 @dataclass
 class AgentResult:
     """Result from a single agent turn."""
@@ -266,6 +297,10 @@ class AgentCore:
         # We dispatch once based on the initial input and reuse it for all rounds
         self._auto_skill_input = user_input
 
+        # Reset flag verification state for this run
+        self._claimed_flag = None
+        self._flag_verified = False
+
         # ── Autonomous loop ─────────────────────────────────────────
         for round_num in range(1, max_rounds + 1):
             result = AgentResult()
@@ -297,6 +332,16 @@ class AgentCore:
                 # Parse findings
                 self._parse_findings(response_text)
 
+                # ★ Check if the LLM performed a verification step
+                # If notes contain "验证成功" or similar, mark flag as verified
+                if hasattr(self, '_claimed_flag') and self._claimed_flag and not getattr(self, '_flag_verified', False):
+                    verification_markers = [
+                        "验证成功", "验证通过", "已验证", "复现成功", "确认flag",
+                        "verified", "confirmed",
+                    ]
+                    if any(m in response_text.lower() for m in verification_markers):
+                        self._flag_verified = True
+
                 # Detect phase transitions from LLM output
                 new_phase = self._detect_phase_from_output(response_text)
                 if new_phase and new_phase != self.context.state.phase:
@@ -305,6 +350,18 @@ class AgentCore:
 
                 # Check if agent signals completion
                 result.should_continue = not self._is_completion_signal(response_text)
+
+                # ★ Flag verification tracking — detect unverified flag claims
+                claimed_flag = self._detect_flag_claim(response_text)
+                if claimed_flag:
+                    if not hasattr(self, '_claimed_flag'):
+                        self._claimed_flag = claimed_flag
+                        self._flag_verified = False
+                        # Don't stop on first flag claim — force verification round
+                        result.should_continue = True
+                    elif self._claimed_flag == claimed_flag and hasattr(self, '_flag_verified') and not self._flag_verified:
+                        # Same flag claimed again without verification — keep going
+                        result.should_continue = True
 
                 # Record step
                 self.context.state.add_step(f"Round {round_num}: {response_text[:100]}...")
@@ -367,6 +424,20 @@ class AgentCore:
         if state.notes:
             notes_summary = f"\n重要笔记: {'; '.join(state.notes[-5:])}"
 
+        # Flag verification warning — if a flag was claimed but not verified
+        flag_warning = ""
+        claimed_flag = getattr(self, '_claimed_flag', None)
+        flag_verified = getattr(self, '_flag_verified', False)
+        if claimed_flag and not flag_verified:
+            flag_warning = (
+                f"\n\n⚠️ 你之前声称找到了 flag: {claimed_flag}"
+                f"\n但这个 flag 未经独立验证！你必须："
+                f"\n1. 用工具重新发送 payload 确认结果可复现"
+                f"\n2. 或用不同方法交叉验证（如换一个函数/路径读取同一内容）"
+                f"\n3. 如果验证失败，必须承认之前的 flag 是错误的，继续解题"
+                f"\n在验证完成前，不要标记 [DONE]"
+            )
+
         return (
             f"\n\n[自主循环 Round {round_num}/{max_rounds}]"
             f"\n当前目标: {state.target or '未设置'}"
@@ -375,6 +446,7 @@ class AgentCore:
             f"{steps_summary}"
             f"{recon_summary}"
             f"{notes_summary}"
+            f"{flag_warning}"
             f"\n\n请基于当前状态和之前所有发现决定下一步操作，持续推进渗透测试。"
             f"\n注意：不要重复之前已经做过的操作，专注于推进到下一步。"
             f"\n如果发现重要线索或完成测试，在回复末尾添加 [DONE] 标记。"
@@ -408,6 +480,26 @@ class AgentCore:
             "任务完成",
         ]
         return any(s in output for s in completion_signals)
+
+    def _detect_flag_claim(self, output: str) -> Optional[str]:
+        """Detect if the LLM claims to have found a flag, return the claimed flag or None.
+
+        This is used to trigger automatic verification — if the LLM claims
+        a flag but we can't verify it independently, we should NOT stop.
+        """
+        # Common CTF flag patterns
+        flag_patterns = [
+            r'(NSSCTF\{[^}]+\})',
+            r'(CTF\{[^}]+\})',
+            r'(flag\{[^}]+\})',
+            r'(Flag\{[^}]+\})',
+            r'(FLAG\{[^}]+\})',
+        ]
+        for pattern in flag_patterns:
+            match = re.search(pattern, output, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return None
 
     # ── LLM call methods ────────────────────────────────────────────
 

@@ -123,6 +123,7 @@ class SessionConfig(BaseModel):
     report_format: str = Field(default="markdown", description="Default report format: markdown, html")
     poc_language: str = Field(default="python", description="Default PoC language: python, bash")
     max_rounds: int = Field(default=15, description="Max autonomous pentest rounds (1-100)")
+    show_thinking: bool = Field(default=False, description="Show LLM thinking/reasoning output (default: off)")
 
 
 class VulnClawConfig(BaseModel):

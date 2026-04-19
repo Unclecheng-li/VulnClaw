@@ -23,6 +23,7 @@ from rich.text import Text
 
 from vulnclaw import __version__
 from vulnclaw.config.settings import load_config, set_config_value, save_config, apply_provider_preset, list_providers
+from vulnclaw.agent.core import strip_think_tags, format_think_tags
 
 app = typer.Typer(
     name="vulnclaw",
@@ -54,6 +55,14 @@ def _print_banner() -> None:
     console.print(logo)
     console.print(subtitle)
     console.print()
+
+
+def _print_agent_output(output: str, config) -> None:
+    """Print agent output with think-tag filtering based on config."""
+    from vulnclaw.agent.core import format_think_tags
+    formatted = format_think_tags(output, show=config.session.show_thinking)
+    if formatted:
+        console.print(formatted)
 
 
 # ── REPL ────────────────────────────────────────────────────────────
@@ -117,7 +126,7 @@ def _run_repl() -> None:
                 continue
 
             elif cmd_lower == "status":
-                _print_status(agent, mcp_manager, current_target, current_phase)
+                _print_status(agent, mcp_manager, current_target, current_phase, config)
                 continue
 
             elif cmd_lower.startswith("target "):
@@ -140,6 +149,24 @@ def _run_repl() -> None:
                         console.print(f"  • {tool}")
                 else:
                     console.print("[-] 无可用 MCP 工具")
+                continue
+
+            elif cmd_lower == "think":
+                # Toggle think tag display
+                config.session.show_thinking = not config.session.show_thinking
+                state_str = "[green]显示[/]" if config.session.show_thinking else "[yellow]隐藏[/]"
+                console.print(f"[*] 推理过程显示: {state_str}")
+                console.print("[dim]    使用 think on/off 精确控制[/]")
+                continue
+
+            elif cmd_lower == "think on":
+                config.session.show_thinking = True
+                console.print("[*] 推理过程显示: [green]显示[/]")
+                continue
+
+            elif cmd_lower == "think off":
+                config.session.show_thinking = False
+                console.print("[*] 推理过程显示: [yellow]隐藏[/]")
                 continue
 
             # Route to agent — detect if this should be an autonomous loop
@@ -165,7 +192,7 @@ def _run_repl() -> None:
                             # Real-time output for each round
                             console.print(f"[dim]── Round {round_num} ──[/]")
                             if result.output:
-                                console.print(result.output)
+                                _print_agent_output(result.output, config)
                             console.print()
 
                             # Update target & phase from result
@@ -215,7 +242,7 @@ def _run_repl() -> None:
 
                         # Display agent output
                         if result.output:
-                            console.print(result.output)
+                            _print_agent_output(result.output, config)
 
             except KeyboardInterrupt:
                 console.print("\n[!] 用户中断")
@@ -239,6 +266,8 @@ def _print_help() -> None:
   [cyan]target <host>[/]   设置渗透测试目标
   [cyan]status[/]          查看当前状态
   [cyan]tools[/]           列出可用 MCP 工具
+  [cyan]think[/]           切换推理过程显示/隐藏
+  [cyan]think on/off[/]    精确控制推理过程显示
   [cyan]clear[/]           清空当前会话
   [cyan]help[/]            显示此帮助
   [cyan]exit / quit[/]     退出
@@ -257,13 +286,15 @@ def _print_help() -> None:
     console.print(Panel(help_text, title="🦞 VulnClaw 帮助", border_style="cyan"))
 
 
-def _print_status(agent, mcp_manager, target, phase) -> None:
+def _print_status(agent, mcp_manager, target, phase, config) -> None:
     """Print current session status."""
+    think_state = "[green]显示[/]" if config.session.show_thinking else "[yellow]隐藏[/]"
     console.print(Panel(
         f"目标: [bold]{target or '未设置'}[/]\n"
         f"阶段: [bold]{phase}[/]\n"
         f"MCP 服务: [bold]{mcp_manager.running_count()}[/] 运行中\n"
-        f"可用工具: [bold]{len(mcp_manager.list_available_tools())}[/] 个",
+        f"可用工具: [bold]{len(mcp_manager.list_available_tools())}[/] 个\n"
+        f"推理过程: {think_state}",
         title="🦞 当前状态",
         border_style="green",
     ))
@@ -300,7 +331,7 @@ def run(
             prompt,
             target=target,
             max_rounds=config.session.max_rounds,
-            on_step=lambda r, res: console.print(f"[dim]Round {r}[/]: {res.output[:200]}...") if res.output else None,
+            on_step=lambda r, res: _print_agent_output(f"[dim]Round {r}[/]: {res.output[:200]}...", config) if res.output else None,
         )
         return results
 
