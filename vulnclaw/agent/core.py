@@ -854,13 +854,15 @@ class AgentCore:
                 )
             elif is_complete and rounds_no_progress >= 3:
                 # ★ Force summary: all dims done + no new progress for 3+ rounds
+                output_dir = str(self.config.session.output_dir.resolve())
                 recon_dim_status += (
                     f"\n\n🔴 侦察强制总结指令："
                     f"\n你已经连续 {rounds_no_progress} 轮没有任何新的工具发现，所有维度均已完成 ✅。"
                     f"\n请立即执行以下操作（不要继续发送请求）："
                     f"\n1. 整理已收集的所有侦察信息"
-                    f"\n2. 使用 python_execute 将侦察报告保存到桌面"
-                    f"\n   路径格式: ~/Desktop/{{目标}}_侦察报告_{{日期}}.md"
+                    f"\n2. 使用 python_execute 将侦察报告保存到输出目录"
+                    f"\n   路径: \"{output_dir}/{{目标}}_侦察报告_{{日期}}.md\""
+                    f"\n   如果目录不存在，先 os.makedirs(\"{output_dir}\", exist_ok=True)"
                     f"\n3. 在回复末尾添加 [DONE] 标记结束本次侦察"
                     f"\n⚠️ 禁止继续重复分析已有信息或发送新请求！"
                 )
@@ -874,6 +876,7 @@ class AgentCore:
             f"\n\n[自主循环 Round {round_num}/{max_rounds}]"
             f"\n当前目标: {state.target or '未设置'}"
             f"\n当前阶段: {state.phase.value}"
+            f"\n输出目录: {self.config.session.output_dir.resolve()}"
             f"{findings_summary}"
             f"{facts_summary}"
             f"{assumptions_summary}"
@@ -1199,6 +1202,9 @@ class AgentCore:
             lambda: client.chat.completions.create(**kwargs),
         )
 
+        if response is None or not response.choices:
+            return "[!] LLM API 异常响应（配额耗尽/限流/网络错误），请稍后重试"
+
         choice = response.choices[0]
 
         # Handle tool calls
@@ -1253,6 +1259,9 @@ class AgentCore:
             lambda: client.chat.completions.create(**kwargs),
         )
 
+        if response is None or not response.choices:
+            return "[!] LLM API 异常响应（配额耗尽/限流/网络错误），请稍后重试"
+
         choice = response.choices[0]
 
         # Handle tool calls — execute them and feed result back
@@ -1303,6 +1312,8 @@ class AgentCore:
                     None,
                     lambda: client.chat.completions.create(**kwargs),
                 )
+                if response2 is None or not response2.choices:
+                    return f"[tool results processed] 工具已执行完毕，但二次总结请求失败（API 异常），请继续分析"
                 final_text = self._extract_response(response2.choices[0].message)
                 # Persist the follow-up LLM response too
                 self.context.add_assistant_message(final_text)
@@ -1746,11 +1757,15 @@ class AgentCore:
                 proto = port.get("protocol", "tcp")
                 port_state = port.find("state")
                 svc = port.find("service")
+                state_val = port_state.get("state", "unknown") if port_state is not None else "unknown"
+                svc_name = svc.get("name", "") if svc is not None else ""
+                svc_product = svc.get("product", "") if svc is not None else ""
+                svc_version = svc.get("version", "") if svc is not None else ""
                 lines.append(
                     f"  {proto.upper():5} {port_id}/{'s' if svc is not None and svc.get('tunnel') == 'ssl' else ''} "
-                    f"{port_state.get('state', 'unknown'):8}"
-                    f"{svc.get('name', ''):15}"
-                    f"{svc.get('product', '')} {svc.get('version', '')}".rstrip()
+                    f"{state_val:8}"
+                    f"{svc_name:15}"
+                    f"{svc_product} {svc_version}".rstrip()
                 )
                 # Scripts (for vuln scan)
                 for script in port.findall("script"):
@@ -1850,6 +1865,10 @@ class AgentCore:
                 return "[✓] 代码执行成功，无输出"
 
             output = "\n".join(output_parts)
+            # ★ Strip completion signals from code output to prevent
+            # python_execute from faking a [DONE] that stops the auto loop
+            for sig in ["[DONE]", "[COMPLETE]"]:
+                output = output.replace(sig, f"[BLOCKED_{sig[1:-1]}]")
             # Truncate if too long
             if len(output) > 8000:
                 output = output[:4000] + "\n...[中间省略]...\n" + output[-4000:]

@@ -59,10 +59,13 @@ def _print_banner() -> None:
 
 def _print_agent_output(output: str, config) -> None:
     """Print agent output with think-tag filtering based on config."""
+    from rich.markup import escape as rich_escape
     from vulnclaw.agent.core import format_think_tags, strip_think_tags
     formatted = format_think_tags(output, show=config.session.show_thinking)
     if formatted:
-        console.print(formatted)
+        # LLM output may contain Rich-style brackets like [/TOOL_CALL] which
+        # cause MarkupError.  Escape before printing so they render literally.
+        console.print(rich_escape(formatted))
     elif not config.session.show_thinking:
         # Check if the original output had thinking content that was stripped
         stripped = strip_think_tags(output)
@@ -339,7 +342,9 @@ def _run_repl() -> None:
             except KeyboardInterrupt:
                 console.print("\n[!] 用户中断")
             except Exception as e:
-                console.print(f"[!] 错误: {e}")
+                # Escape Rich markup chars in exception message to prevent MarkupError
+                from rich.markup import escape as rich_escape
+                console.print(f"[!] 错误: {rich_escape(str(e))}")
 
         except KeyboardInterrupt:
             console.print("\n[dim]Ctrl+C 退出，输入 exit 确认[/]")

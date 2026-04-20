@@ -36,6 +36,11 @@ dependencies = [
     "toml>=0.10.0",
     "mcp>=1.0.0",
     "jinja2>=3.1.0",
+    # ── 沙箱依赖（python_execute 运行时）──────────────────────────────
+    # LLM 在 python_execute 中可直接 import 以下库
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+    "pycryptodome>=3.19.0",
 ]
 
 [project.optional-dependencies]
