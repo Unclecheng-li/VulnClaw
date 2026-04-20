@@ -446,6 +446,7 @@ class AgentCore:
         self._last_findings_count = 0
         self._last_notes_count = 0
         self._last_steps_count = 0
+        self._python_timeout_rounds = 0  # track consecutive rounds with Python timeout
 
         # ★ Attack path tracking: detect when the agent is stuck on one path
         self._current_attack_path = None  # e.g. "regex_bypass", "rce", "file_inclusion"
@@ -611,6 +612,7 @@ class AgentCore:
                 
                 if has_new_progress:
                     self._rounds_without_progress = 0
+                    self._python_timeout_rounds = 0  # reset on progress
                 else:
                     self._rounds_without_progress += 1
                 
@@ -774,6 +776,17 @@ class AgentCore:
                 "\n\n❌ 常见致命假设：preg_replace 只替换第一个匹配 / Python 模拟 = 服务器行为 / 参数名是某个值"
             )
 
+        # ★ Python timeout tracking — warn when previous rounds had Python timeouts
+        python_timeout_warning = ""
+        python_timeout_rounds = getattr(self, '_python_timeout_rounds', 0)
+        if python_timeout_rounds >= 1:
+            python_timeout_warning = (
+                f"\n\n⚠️ **代码执行警告**：上轮 Python 脚本超时了。"
+                f"\n禁止写超过 10 行的复杂脚本。"
+                f"\n优先使用已有的工具（fetch/python_execute）而非自己写爬虫/解析代码。"
+                f"\n禁止重复执行相同的大段脚本。"
+            )
+
         # ★ Dead-loop detection — if no progress for multiple rounds
         dead_loop_warning = ""
         rounds_no_progress = getattr(self, '_rounds_without_progress', 0)
@@ -853,18 +866,27 @@ class AgentCore:
                     f"\n请继续对未完成的维度执行检查，确保每个维度都至少做过一轮。"
                 )
             elif is_complete and rounds_no_progress >= 3:
-                # ★ Force summary: all dims done + no new progress for 3+ rounds
+                # ★ Force transition to exploitation: all dims done + no new progress for 3+ rounds
+                #   Previously this told LLM to save a report + [DONE], keeping it stuck in recon.
+                #   Now it forces the agent into VULN_DISCOVERY / EXPLOITATION.
                 output_dir = str(self.config.session.output_dir.resolve())
                 recon_dim_status += (
-                    f"\n\n🔴 侦察强制总结指令："
-                    f"\n你已经连续 {rounds_no_progress} 轮没有任何新的工具发现，所有维度均已完成 ✅。"
-                    f"\n请立即执行以下操作（不要继续发送请求）："
-                    f"\n1. 整理已收集的所有侦察信息"
-                    f"\n2. 使用 python_execute 将侦察报告保存到输出目录"
-                    f"\n   路径: \"{output_dir}/{{目标}}_侦察报告_{{日期}}.md\""
-                    f"\n   如果目录不存在，先 os.makedirs(\"{output_dir}\", exist_ok=True)"
-                    f"\n3. 在回复末尾添加 [DONE] 标记结束本次侦察"
-                    f"\n⚠️ 禁止继续重复分析已有信息或发送新请求！"
+                    f"\n\n🔴 ★★★ 侦察→利用阶段强制切换 ★★★\n"
+                    f"所有维度均已完成 ✅，连续 {rounds_no_progress} 轮无新进展。\n"
+                    f"你必须立即切换到【漏洞利用阶段】，而不是继续收集信息或保存报告。\n\n"
+                    f"★ 立即执行以下操作：\n"
+                    f"1. 在回复中输出「切换到漏洞发现」或「阶段: vuln_discovery」\n"
+                    f"2. 基于已收集的侦察结果（目标画像/旁站/API泄露等），\n"
+                    f"   对最高价值的攻击面实施实际的漏洞利用\n"
+                    f"3. 【禁止】继续保存侦察报告或调用信息收集类工具\n"
+                    f"4. 【禁止】重复已有的发现，必须有新的实际验证步骤\n\n"
+                    f"★ 最高优先级目标（基于侦察结果）：\n"
+                    f"   - shenbao.conac.cn 的 /guest/checkuser 用户枚举 → 实际验证枚举效果\n"
+                    f"   - shenbao.conac.cn 的 /net-id-api/captcha → 验证验证码是否能被破解\n"
+                    f"   - 对发现的旁站进行针对性漏洞测试\n\n"
+                    f"★ 输出目录（侦察报告由框架自动保存，不需要你手动保存）：\n"
+                    f"   {output_dir}\n"
+                    f"⚠️ 本次渗透的目标是【实际漏洞利用成功】，不是侦察报告！"
                 )
             if round_num < RECON_MIN_ROUNDS:
                 recon_dim_status += (
@@ -887,6 +909,7 @@ class AgentCore:
             f"{path_warning}"
             f"{path_switch_warning}"
             f"{assumption_reminder}"
+            f"{python_timeout_warning}"
             f"{dead_loop_warning}"
             f"{flag_warning}"
             f"{ctf_mode_warning}"
@@ -1251,13 +1274,24 @@ class AgentCore:
             kwargs["reasoning_effort"] = self.config.llm.reasoning_effort
             kwargs.pop("temperature", None)
 
-        # Use asyncio to run sync OpenAI call
+        # Use asyncio to run sync OpenAI call with retry on overload/timeout
         import asyncio
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: client.chat.completions.create(**kwargs),
-        )
+        for attempt in range(3):
+            try:
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: client.chat.completions.create(**kwargs),
+                )
+                break
+            except Exception as e:
+                err_str = str(e).lower()
+                if attempt < 2 and any(kw in err_str for kw in ["overloaded", "529", "rate limit", "timeout", "timed out", "connection"]):
+                    await asyncio.sleep((attempt + 1) * 5)
+                    continue
+                else:
+                    response = None
+                    break
 
         if response is None or not response.choices:
             return "[!] LLM API 异常响应（配额耗尽/限流/网络错误），请稍后重试"
@@ -1655,6 +1689,9 @@ class AgentCore:
         if not target:
             return "[!] nmap_scan 需要 target 参数（目标 IP 或域名）"
 
+        # Warn if target resolves to a reserved/internal IP
+        ip_warning = self._validate_scan_target(target)
+
         scan_type = args.get("scan_type", "top_ports")
         custom_ports = args.get("ports", "")
         timing = int(args.get("timing", 4))
@@ -1717,7 +1754,60 @@ class AgentCore:
         if result.returncode != 0 and not result.stdout:
             return f"[!] nmap 扫描失败（{result.returncode}）: {result.stderr[:500]}"
 
-        return self._parse_nmap_xml(result.stdout or result.stderr, target)
+        scan_result = self._parse_nmap_xml(result.stdout or result.stderr, target)
+        return ip_warning + scan_result
+
+    # ── Reserved IP detection helpers ─────────────────────────────────
+
+    _RESERVED_IP_RANGES = [
+        ("198.18.0.0", "198.19.255.255", "RFC 2544 基准测试地址"),
+        ("10.0.0.0", "10.255.255.255", "RFC 1918 私有地址"),
+        ("172.16.0.0", "172.31.255.255", "RFC 1918 私有地址"),
+        ("192.168.0.0", "192.168.255.255", "RFC 1918 私有地址"),
+        ("127.0.0.0", "127.255.255.255", "RFC 1122 环回地址"),
+        ("169.254.0.0", "169.254.255.255", "RFC 3927 链路本地"),
+        ("0.0.0.0", "0.255.255.255", "RFC 1122 当前网络"),
+        ("224.0.0.0", "239.255.255.255", "RFC 5771 多播地址"),
+        ("240.0.0.0", "255.255.255.255", "RFC 1112 保留地址"),
+    ]
+
+    def _is_reserved_ip(self, ip: str) -> tuple[bool, str]:
+        """Check if an IP is in a reserved/internal range.
+
+        Returns (True, reason) if reserved, (False, "") if public.
+        """
+        try:
+            import ipaddress
+            addr = ipaddress.ip_address(ip)
+            for start, end, desc in self._RESERVED_IP_RANGES:
+                if ipaddress.ip_address(start) <= addr <= ipaddress.ip_address(end):
+                    return True, desc
+            return False, ""
+        except Exception:
+            return False, ""
+
+    def _validate_scan_target(self, target: str) -> str:
+        """Check if target resolves to a reserved IP; warn the LLM.
+
+        Returns a warning string if reserved, empty string if fine.
+        """
+        import socket
+        try:
+            ips = socket.getaddrinfo(target, None, socket.AF_INET)
+            if not ips:
+                return ""
+            ip = ips[0][4][0]
+            is_reserved, reason = self._is_reserved_ip(ip)
+            if is_reserved:
+                return (
+                    f"\n\n⚠️ **警告：目标 {target} 解析到保留/内网地址 ({reason})\n"
+                    f"   IP: {ip}\n"
+                    f"   扫描此地址得到的结果不代表真实系统的安全状态。\n"
+                    f"   nmap 扫描结果中的端口信息可能与真实目标无关。**"
+                )
+        except Exception:
+            pass
+        return ""
 
     def _parse_nmap_xml(self, xml_output: str, target: str) -> str:
         """Parse nmap XML output into a readable summary."""
@@ -1745,7 +1835,12 @@ class AgentCore:
             status = host.find("status")
             status_val = status.get("state", "unknown") if status is not None else "unknown"
 
-            host_str = f"\n[主机] {addrs[0] if addrs else target}"
+            host_ip = addrs[0] if addrs else target
+            is_reserved, reason = self._is_reserved_ip(host_ip)
+            if is_reserved:
+                host_str = f"\n[主机] {host_ip} ⚠️ **保留地址 ({reason})，测试网络结果不代表真实目标安全状态**"
+            else:
+                host_str = f"\n[主机] {host_ip}"
             if hostname is not None:
                 host_str += f" ({hostname.get('name', '')})"
             host_str += f" — {status_val}"
@@ -1880,7 +1975,8 @@ class AgentCore:
                 os.unlink(tmp_path)
             except OSError:
                 pass
-            return "[!] Python 执行超时（30秒），请简化代码或分步执行"
+            self._python_timeout_rounds = getattr(self, '_python_timeout_rounds', 0) + 1
+            return "[!] Python 执行超时（30秒），请简化代码或分步执行，禁止写超过10行的复杂脚本"
         except Exception as e:
             try:
                 os.unlink(tmp_path)

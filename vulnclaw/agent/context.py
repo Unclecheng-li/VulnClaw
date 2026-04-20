@@ -34,6 +34,19 @@ class VulnerabilityFinding(BaseModel):
     remediation: str = Field(default="", description="Fix recommendation")
     poc_script: Optional[str] = Field(default=None, description="Generated PoC script path")
 
+    def model_post_init(self, *args, **kwargs) -> None:
+        # ★ Vulnerability completeness validation
+        # If severity is High/Critical but evidence, vuln_type, remediation are all empty,
+        # this is a placeholder finding — warn but allow it.
+        if self.severity in ("Critical", "High"):
+            if not self.evidence and not self.vuln_type and not self.remediation:
+                self.title = f"[未验证] {self.title}"
+                self.description = (
+                    f"(⚠️ 此漏洞缺少验证证据/vuln_type/修复建议三字段，"
+                    f"LLM 上报时未附实际测试结果。请补充证据后再作为正式漏洞。)"
+                    + (f" {self.description}" if self.description else "")
+                )
+
 
 class SessionState(BaseModel):
     """Full session state for a pentest engagement."""
