@@ -53,7 +53,7 @@ VulnClaw 自动执行：
 - **8 个 LLM Provider** — OpenAI / MiniMax / DeepSeek / 智谱 / Moonshot / 千问 / SiliconFlow，一键切换
 - **MCP 工具链** — 11 个安全 MCP 服务 + 23 个工具定义（fetch / Burp / Frida / Chrome DevTools / IDA Pro 等）
 - **AI Agent 核心** — OpenAI 兼容协议 + Tool Calling + 自主渗透循环
-- **19 个渗透 Skill** — 7 核心 + 12 专项 Skill（含 CTF Web/Crypto/Misc），含 131 个参考文档
+- **20 个渗透 Skill** — 7 核心 + 13 专项 Skill（含 CTF Web/Crypto/Misc + osint-recon），含 138 个参考文档
 - **编解码/加解密工具** — 29 种操作（Base64/Hex/URL/AES/JWT/Morse 等），LLM 可精确调用，不再靠猜测
 - **Python 代码执行** — 内置 `python_execute` 工具，LLM 可写 Python 脚本精确构造 payload 和解析响应
 - **持续性渗透测试** — 周期循环（默认 100 轮/周期 × 10 周期 = 1000 轮），每周期自动生成报告，直到手动终止
@@ -61,19 +61,6 @@ VulnClaw 自动执行：
 - **沙盒模式提示词** — 解锁 AI 安全测试能力，CTF / 授权渗透场景专用
 - **自动报告 & PoC** — 生成结构化 Markdown 报告和可运行的 Python PoC 脚本
 - **安全知识库** — 内置 CVE 数据库、WAF 绕过技巧、漏洞利用方法
-
----
-
-## CTF 能力增强
-
-基于 NSSCTF 实战反馈（68 轮未解出入门题），系统性增强 CTF 解题能力：
-
-- **Python 代码执行** — `python_execute` 工具，LLM 可写脚本精确构造 payload、解析响应差异
-- **上下文记忆增强** — 失败历史保留（避免重复试错）、工具结果首尾保留（不再粗暴截断）、负面信息压缩保留
-- **CTF 专项 Skill** — `ctf-web`(PHP 绕过/RCE/SSTI/反序列化) / `ctf-crypto`(RSA/AES/ECC/格攻击) / `ctf-misc`(PyJail/BashJail/编码链)
-- **代码审计模式** — 系统提示注入「完整源码分析 → 路径选择 → 输出可见性 → Payload 构造」四步流程
-- **反幻觉机制** — 严禁编造工具调用结果 + flag 验证跟踪
-- **CTF 知识库** — 具体绕过值（如 PHP 弱比较 `0e` 值）、空格绕过 payload 模板、命令注入速查表
 
 ---
 
@@ -369,9 +356,10 @@ vulnclaw config provider minimax   # 一键切换
 | pentest-tools             | 18         | 渗透工具速查                                 |
 | rapid-checklist           | 3          | 快速检查清单                                 |
 | crypto-toolkit            | 3          | 编解码/加解密（29 种操作，注册为内置工具）   |
-| **ctf-web**               | 8          | 🆕 CTF Web 攻击知识库（PHP绕过/RCE/SSTI/反序列化） |
-| **ctf-crypto**            | 6          | 🆕 CTF 密码学攻击知识库（RSA/AES/ECC/PRNG/格攻击） |
-| **ctf-misc**              | 6          | 🆕 CTF 杂项知识库（PyJail/BashJail/编码链/VM逆向） |
+| **ctf-web**               | 8          | CTF Web 攻击知识库（PHP绕过/RCE/SSTI/反序列化） |
+| **ctf-crypto**            | 6          | CTF 密码学攻击知识库（RSA/AES/ECC/PRNG/格攻击） |
+| **ctf-misc**              | 6          | CTF 杂项知识库（PyJail/BashJail/编码链/VM逆向） |
+| **osint-recon**           | 7          | OSINT 开源情报收集（四维模型：服务器/网站/域名/人员） |
 
 Skill 会根据用户输入自动调度，无需手动选择。专项 Skill 含 `references/` 目录下的详细方法论文档，LLM 可通过 `load_skill_reference` 工具按需加载。
 
@@ -443,9 +431,10 @@ vulnclaw config set session.show_thinking false # 隐藏推理过程（也可在
 
 | 版本     | 目标                                                    | 状态       |
 | -------- | ------------------------------------------------------- | ---------- |
-| v0.1 MVP | CLI + LLM Agent + 基础 MCP + Skill + 报告 + 多 Provider | ✅ 当前    |
+| v0.1 MVP | CLI + LLM Agent + 基础 MCP + Skill + 报告 + 多 Provider | ✅ 已完成  |
 | v0.1.1   | `python_execute` + 上下文压缩 + 代码审计策略 + 反幻觉  | ✅ 已完成  |
 | v0.1.2   | 3 个 CTF 专项 Skill + 3 个现有 Skill 更新 + 触发词扩展 | ✅ 已完成  |
+| **v0.1.3** | **四维信息收集模型 + RECON_MIN_ROUNDS + 维度完成度自检 + 社工条件触发 + osint-recon Skill** | ✅ **当前** |
 | v0.2     | 移动端能力（Frida / ADB / JADX）+ LLM 调用优化          | 🔜 Skill ✅ |
 | v0.3     | 逆向能力（IDA Pro）— Skill 已就绪                       | 📋 Skill ✅ |
 | v0.4     | 知识库增强（ChromaDB 向量检索 + 语义 Skill 调度）       | 📋         |
