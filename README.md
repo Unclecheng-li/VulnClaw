@@ -12,6 +12,8 @@
 [![Security](https://img.shields.io/badge/Scope-Authorized_Only-red)](#-安全声明)
 <br>
 
+🌐 **English version**: [`README_EN.md`](README_EN.md)
+
 **不是脚本合集，是可运行的 AI 渗透测试 Agent。**
 
 <br>
