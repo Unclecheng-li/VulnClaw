@@ -226,11 +226,35 @@ RECON_INSTRUCTION = """\
 **每个维度都必须至少做过一轮检查后，才允许标记 [DONE]。**
 
 ### 维度一：服务器信息
-- [ ] 开放端口 & 服务版本识别（nmap 全端口扫描或常见端口扫描）
+
+**⚡ 扫描策略：先评估目标类型，再决定是否调用 nmap_scan**
+
+| 目标类型 | nmap_scan 价值 | 推荐策略 |
+|---|---|---|
+| 自建 VPS / 物理服务器 / CTF 靶机 | ⭐⭐⭐ 高 | 优先扫描 |
+| 云主机（阿里云/腾讯云/ AWS） | ⭐⭐ 中 | 可以扫描 |
+| GitHub Pages / GitLab Pages | ❌ 无意义 | **跳过**，直接分析 Web 内容 |
+| Cloudflare / 阿里云 CDN / 腾讯云 WAF | ❌ 被屏蔽 | **跳过**，先找真实 IP |
+| 大型云服务商 + WAF | ❌ 大概率超时 | **跳过**，分析 Web 内容更高效 |
+| 域名（未解析到 IP） | ⏸ 待定 | 先 DNS 解析获取 IP 再评估 |
+
+**⭐ 使用内置 `nmap_scan` 工具执行扫描（优先于 python_execute socket 探测）**
+- [ ] 开放端口 & 服务版本识别 → `nmap_scan(target=目标, scan_type="service")`
 - [ ] 真实 IP 探测（CDN 后的源站 IP — DNS 历史/全局 Ping/邮件头提取）
-- [ ] 操作系统指纹（TTL 推断 + nmap OS 检测）
+- [ ] 操作系统指纹 → `nmap_scan(target=目标, scan_type="os")`
 - [ ] 中间件版本（响应头 + 错误页 + 特征文件探测）
 - [ ] 数据库识别（端口探测 + 错误信息 + 特征行为）
+
+**nmap_scan 快速参考**：
+| scan_type | 用途 |
+|-----------|------|
+| `top_ports` | 扫描 100 个常见端口（快速，首选） |
+| `service` | 服务版本检测（Apache/Nginx/MySQL 等） |
+| `os` | 操作系统指纹识别 |
+| `vuln` | CVE 漏洞扫描（NSE 脚本） |
+| `full` | 全量扫描（SYN+OS+版本+脚本，最慢最全） |
+| `syn` | SYN 半开扫描（需管理员权限） |
+示例：`nmap_scan(target="192.168.1.1", scan_type="service", timing=4)`
 
 ### 维度二：网站信息
 - [ ] 网站架构（OS + 中间件 + 数据库 + 语言 + 框架 → 完整技术栈）

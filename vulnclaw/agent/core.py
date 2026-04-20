@@ -1392,6 +1392,10 @@ class AgentCore:
             except Exception as e:
                 return f"[!] 加载参考文档错误: {e}"
 
+        # Built-in nmap network scanner
+        if tool_name == "nmap_scan":
+            return await self._execute_nmap(args)
+
         # Built-in crypto toolkit
         if tool_name == "crypto_decode":
             try:
@@ -1535,6 +1539,54 @@ class AgentCore:
             },
         })
 
+        # Built-in nmap network scanner
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": "nmap_scan",
+                "description": (
+                    "nmap 网络端口扫描工具。信息收集时用于发现目标开放端口、服务版本和操作系统指纹。\n"
+                    "用法示例：\n"
+                    "  扫描常见端口: scan_type=top_ports, target=1.2.3.4\n"
+                    "  SYN扫描: scan_type=syn, target=1.2.3.4（需要管理员权限）\n"
+                    "  服务版本检测: scan_type=service, target=1.2.3.4\n"
+                    "  漏洞扫描: scan_type=vuln, target=1.2.3.4\n"
+                    "  全量扫描: scan_type=full, target=1.2.3.4\n"
+                    "优先使用 nmap_scan 而非 python_execute 构造 socket 扫描，nmap 更专业更准确。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {
+                            "type": "string",
+                            "description": "目标 IP 地址或域名（必填），如 192.168.1.1 或 scanme.nmap.org",
+                        },
+                        "scan_type": {
+                            "type": "string",
+                            "description": (
+                                "扫描类型。top_ports: 扫描常见端口(默认)；"
+                                "syn: SYN半开扫描(需root)；"
+                                "tcp: TCP连接扫描；"
+                                "service: 服务版本检测；"
+                                "os: 操作系统指纹；"
+                                "vuln: CVE漏洞扫描(NSE脚本)；"
+                                "full: 综合扫描(SYN+OS+版本+脚本)"
+                            ),
+                        },
+                        "ports": {
+                            "type": "string",
+                            "description": "指定端口或范围（可选），如 80,443,8080 或 1-1000",
+                        },
+                        "timing": {
+                            "type": "integer",
+                            "description": "扫描速度模板 0-5（默认4），数字越大越快但越容易被检测",
+                        },
+                    },
+                    "required": ["target"],
+                },
+            },
+        })
+
         # MCP tools
         if self.mcp_manager:
             for schema in self.mcp_manager.get_tool_schemas():
@@ -1564,6 +1616,156 @@ class AgentCore:
         r"open\s*\(\s*['\"].*vulnclaw.*config",
         r"open\s*\(\s*['\"].*\.vulnclaw",
     ]
+
+    async def _execute_nmap(self, args: dict) -> str:
+        """Execute an nmap scan and return structured results.
+
+        Args:
+            target: IP address or hostname to scan (required)
+            scan_type: One of:
+                - top_ports  : Scan top N most common ports (default)
+                - syn        : SYN half-open scan (requires root)
+                - tcp        : Full TCP connect scan
+                - service    : Service and version detection
+                - os         : OS fingerprint detection
+                - vuln       : CVE vulnerability scan via NSE
+                - full       : Full recon (SYN + OS + service + scripts)
+            ports: Comma-separated port list or range (optional, e.g. "80,443,8080" or "1-1000")
+            timing: Timing template 0-5 (default 4, higher = faster but noisier)
+
+        Returns:
+            Structured scan results with ports, services, and OS info.
+        """
+        import shutil
+        import subprocess
+        import xml.etree.ElementTree as ET
+
+        target = args.get("target", "").strip()
+        if not target:
+            return "[!] nmap_scan 需要 target 参数（目标 IP 或域名）"
+
+        scan_type = args.get("scan_type", "top_ports")
+        custom_ports = args.get("ports", "")
+        timing = int(args.get("timing", 4))
+
+        # Find nmap binary
+        nmap_cmd = shutil.which("nmap")
+        if not nmap_cmd:
+            # Try Windows where.exe
+            try:
+                result = subprocess.run(
+                    ["where.exe", "nmap"], capture_output=True, text=True, timeout=10
+                )
+                if result.returncode == 0:
+                    nmap_cmd = result.stdout.strip().split("\n")[0]
+            except Exception:
+                pass
+        if not nmap_cmd:
+            return "[!] nmap 未安装或不在 PATH 中。请确认 nmap 已安装并加入系统 PATH。"
+
+        # Build base command
+        cmd = [nmap_cmd, "-v" if scan_type == "full" else "-q"]
+
+        # Timing template
+        cmd.extend([f"-T{max(0, min(5, timing))}"])
+
+        # Scan type arguments
+        if scan_type == "top_ports":
+            cmd.extend(["--top-ports", "100", "-oX", "-"])
+        elif scan_type == "syn":
+            cmd.extend(["-sS", "-oX", "-"])
+        elif scan_type == "tcp":
+            cmd.extend(["-sT", "-oX", "-"])
+        elif scan_type == "service":
+            cmd.extend(["-sV", "-oX", "-"])
+        elif scan_type == "os":
+            cmd.extend(["-O", "-oX", "-"])
+        elif scan_type == "vuln":
+            cmd.extend(["--script", "vuln", "-oX", "-"])
+        elif scan_type == "full":
+            cmd.extend(["-sS", "-O", "-sV", "--script", "default,safe", "-oX", "-"])
+        else:
+            cmd.extend(["-sV", "-oX", "-"])
+
+        # Custom ports
+        if custom_ports:
+            cmd.extend(["-p", custom_ports])
+
+        cmd.append(target)
+
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            return "[!] nmap 扫描超时（120秒），请减少扫描范围或使用更快的 timing"
+        except Exception as e:
+            return f"[!] nmap 执行错误: {e}"
+
+        if result.returncode != 0 and not result.stdout:
+            return f"[!] nmap 扫描失败（{result.returncode}）: {result.stderr[:500]}"
+
+        return self._parse_nmap_xml(result.stdout or result.stderr, target)
+
+    def _parse_nmap_xml(self, xml_output: str, target: str) -> str:
+        """Parse nmap XML output into a readable summary."""
+        import xml.etree.ElementTree as ET
+
+        if not xml_output or "<nmaprun" not in xml_output:
+            # Fallback: return raw output if XML parsing fails
+            lines = xml_output.strip().splitlines()[:80]
+            return "nmap 原始输出:\n" + "\n".join(lines)
+
+        try:
+            root = ET.fromstring(xml_output)
+        except ET.ParseError:
+            lines = xml_output.strip().splitlines()[:80]
+            return "nmap 原始输出:\n" + "\n".join(lines)
+
+        lines = [f"nmap 扫描结果 — {target}"]
+        lines.append("=" * 60)
+
+        # Parse host info
+        for host in root.findall(".//host"):
+            hostname = host.find(".//hostname[@type='user']")
+            host_addr = host.find("address[@addr]")
+            addrs = [a.get("addr", "") for a in host.findall("address")]
+            status = host.find("status")
+            status_val = status.get("state", "unknown") if status is not None else "unknown"
+
+            host_str = f"\n[主机] {addrs[0] if addrs else target}"
+            if hostname is not None:
+                host_str += f" ({hostname.get('name', '')})"
+            host_str += f" — {status_val}"
+            lines.append(host_str)
+
+            # Ports
+            for port in host.findall(".//port"):
+                port_id = port.get("portid", "")
+                proto = port.get("protocol", "tcp")
+                port_state = port.find("state")
+                svc = port.find("service")
+                lines.append(
+                    f"  {proto.upper():5} {port_id}/{'s' if svc is not None and svc.get('tunnel') == 'ssl' else ''} "
+                    f"{port_state.get('state', 'unknown'):8}"
+                    f"{svc.get('name', ''):15}"
+                    f"{svc.get('product', '')} {svc.get('version', '')}".rstrip()
+                )
+                # Scripts (for vuln scan)
+                for script in port.findall("script"):
+                    lines.append(f"    | {script.get('id', '')}: {script.get('output', '')[:120]}")
+
+        # Extra info
+        runstats = root.find(".//runstats")
+        if runstats is not None:
+            finished = runstats.find("finished")
+            if finished is not None:
+                elapsed = finished.get("elapsed", "")
+                summary = finished.get("summary", "")
+                lines.append(f"\n完成时间: {elapsed}s | {summary}")
+
+        return "\n".join(lines) or f"nmap 扫描完成（无输出）: {target}"
 
     async def _execute_python(self, args: dict) -> str:
         """Execute a Python code snippet in a sandboxed subprocess.
