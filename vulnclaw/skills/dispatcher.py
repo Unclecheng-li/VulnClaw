@@ -61,6 +61,13 @@ SKILL_INTENT_MAP: dict[str, list[str]] = {
     "bashjail|bash沙箱|restricted shell|rbash逃逸": ["ctf-misc"],
     "编码链|多层编码|杂项|misc|隐写|stego": ["ctf-misc"],
     "ctfd|夺旗平台|flag提交|题目下载": ["ctf-misc"],
+    # ── OSINT specialized skill — refined routing ───────────────────
+    # osint-recon: Full-dimension recon (OSINT + social engineering)
+    # Triggered only when user explicitly mentions social engineering / OSINT / author tracking
+    "社会工程|社工|作者追踪|人物追踪|目标画像|人物画像": ["osint-recon"],
+    "跨平台|用户名搜索|身份关联|github追踪|bilibili追踪": ["osint-recon"],
+    # Full/deep recon — trigger osint-recon for comprehensive 4-dimension collection
+    "全面侦察|深度侦察|完整信息收集|全面信息收集|深度收集|搜集基础信息": ["osint-recon"],
 }
 
 

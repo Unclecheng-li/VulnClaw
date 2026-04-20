@@ -13,7 +13,42 @@ from typing import Any, Callable, Optional
 
 from vulnclaw.config.schema import VulnClawConfig
 from vulnclaw.agent.context import ContextManager, PentestPhase, SessionState
-from vulnclaw.agent.prompts import build_system_prompt, AUTO_PENTEST_INSTRUCTION
+from vulnclaw.agent.prompts import build_system_prompt, AUTO_PENTEST_INSTRUCTION, RECON_INSTRUCTION
+
+# ── Recon minimum rounds & dimension tracking ──────────────────────
+
+RECON_MIN_ROUNDS = 8  # 信息收集阶段最低轮数，低于此数 [DONE] 被忽略
+
+# Keywords that indicate each recon dimension has been explored
+# ⚠️ These keywords must ONLY appear in tool results (not LLM reasoning text)
+# Personnel dimension uses tool-result-only detection to avoid code snippet false positives
+_RECON_DIM_KEYWORDS: dict[str, list[str]] = {
+    "server": [
+        "端口", "port", "nmap", "开放", "open", "服务版本", "service",
+        "真实ip", "real ip", "cdn", "源站", "操作系统", "os检测", "ttl",
+        "中间件", "middleware", "数据库", "database", "mysql", "redis",
+    ],
+    "website": [
+        "waf", "web应用防火墙", "敏感目录", "目录扫描", "dirsearch", "gobuster",
+        "源码泄露", ".git", ".svn", ".ds_store", ".env", "备份文件", ".bak",
+        "旁站", "同ip", "c段", "同网段", "指纹", "cms", "框架", "framework",
+        "架构", "技术栈", "web指纹",
+    ],
+    "domain": [
+        "whois", "注册人", "注册商", "icp", "备案", "子域名", "subdomain",
+        "dns记录", "cname", "mx记录", "txt记录", "证书透明", "crt.sh",
+        "证书信息", "ssl证书",
+    ],
+    # ⚠️ personnel: 只检测真正的社工行动结果，不靠代码片段中的通用词
+    # "github", "邮箱", "twitter" 等在任何 python_execute 代码中都可能出现
+    "personnel": [
+        # 真正的 GitHub API 返回结果特征
+        "github_id", "followers", "following", "public_repos",
+        "unclecheng",  # 从 GitHub API 返回中提取的真实姓名
+        # 真正的社工发现结果（不是代码中的字符串）
+        "twitter",  # 但必须是 URL 路径中的，不是 import 语句
+    ],
+}
 
 
 # ── Think tag filtering ────────────────────────────────────────
@@ -134,16 +169,65 @@ class AgentCore:
         # Determine current phase
         phase = self.context.state.phase.value if self.context.state.phase != PentestPhase.IDLE else None
 
+        # ★ Determine if personnel dimension (dimension 4) should be enabled
+        # Only enable when user explicitly mentions social engineering / OSINT / author tracking
+        personnel_keywords = [
+            "社会工程", "社工", "人员信息", "作者追踪", "人物追踪", "人物画像",
+            "osint", "情报", "调查", "作者",
+        ]
+        enable_personnel = any(kw in (user_input or "").lower() for kw in personnel_keywords)
+        # Also check recon_dimension4_active from state (set during auto_pentest init)
+        if hasattr(self.context.state, 'recon_dimension4_active') and self.context.state.recon_dimension4_active:
+            enable_personnel = True
+
         prompt = build_system_prompt(
             target=target or self.context.state.target,
             phase=phase,
             skill_context=skill_context,
             mcp_tools=mcp_tools,
+            enable_personnel_dim=enable_personnel,
         )
 
         # Add auto-pentest instruction when in autonomous mode
         if auto_mode:
             prompt += "\n\n" + AUTO_PENTEST_INSTRUCTION
+
+        # Add recon instruction when user input suggests information gathering
+        if user_input:
+            recon_triggers = [
+                "搜集", "收集", "信息收集", "侦察", "recon", "osint",
+                "社会工程", "社工", "调查", "作者", "人物", "情报",
+                "分析目标", "目标分析", "资产发现", "子域名",
+            ]
+            if any(t in user_input.lower() for t in recon_triggers):
+                if enable_personnel:
+                    # Full four-dimension model including personnel
+                    prompt += "\n\n" + RECON_INSTRUCTION
+                else:
+                    # Three-dimension model — personnel dimension deactivated
+                    # Mark dimension 4 items as skipped so LLM knows not to do social eng
+                    recon_no_personnel = RECON_INSTRUCTION.replace(
+                        "### 维度四：人员信息 ⚡ 条件触发",
+                        "### 维度四：人员信息 ⚡ 条件触发（本次未激活 — 用户未提及社工/人员追踪需求）"
+                    )
+                    # Replace unchecked items with "skipped" marks
+                    recon_no_personnel = recon_no_personnel.replace(
+                        "- [ ] 姓名 & 职务",
+                        "- [x] 姓名 & 职务（未激活，跳过）"
+                    ).replace(
+                        "- [ ] 生日 & 联系电话",
+                        "- [x] 生日 & 联系电话（未激活，跳过）"
+                    ).replace(
+                        "- [ ] 邮件地址",
+                        "- [x] 邮件地址（未激活，跳过）"
+                    ).replace(
+                        "- [ ] 社交媒体账号（B站、微博、知乎、Twitter、LinkedIn、GitHub）",
+                        "- [x] 社交媒体账号（未激活，跳过）"
+                    ).replace(
+                        "- [ ] 跨平台关联（用用户名/邮箱搜索其他平台，检查历史提交记录中的邮箱）",
+                        "- [x] 跨平台关联（未激活，跳过）"
+                    )
+                    prompt += "\n\n" + recon_no_personnel
 
         return prompt
 
@@ -244,7 +328,11 @@ class AgentCore:
     # ── Single-turn chat (for manual REPL interaction) ──────────────
 
     async def chat(self, user_input: str, target: Optional[str] = None) -> AgentResult:
-        """Process a user message and return agent response (single turn)."""
+        """Process a user message and return agent response (single turn).
+
+        For multi-step tasks with targets, use auto_pentest() instead.
+        Chat mode is for quick Q&A and simple single-step queries.
+        """
         result = AgentResult()
 
         # Detect target and phase from input
@@ -338,6 +426,21 @@ class AgentCore:
         self._flag_claim_count = 0  # Track how many times the same flag is claimed
         self._post_flag_rounds = 0  # Track rounds after flag is verified (safety exit)
 
+        # ★ Recon dimension completion tracking
+        self._is_recon_phase = detected_phase == PentestPhase.RECON
+        if self._is_recon_phase:
+            self.context.state.recon_dimensions_completed = {
+                "server": False, "website": False, "domain": False, "personnel": False,
+            }
+            # Detect if dimension 4 (personnel) should be activated
+            social_engineering_keywords = [
+                "社会工程", "社工", "人员信息", "作者追踪", "人物追踪", "人物画像",
+                "osint", "情报", "作者", "调查",
+            ]
+            self.context.state.recon_dimension4_active = any(
+                kw in user_input.lower() for kw in social_engineering_keywords
+            )
+
         # ★ Dead-loop detection: track rounds without progress
         self._rounds_without_progress = 0
         self._last_findings_count = 0
@@ -387,6 +490,10 @@ class AgentCore:
 
                 # Parse findings
                 self._parse_findings(response_text)
+
+                # ★ Auto-detect recon dimension completion from LLM output
+                if getattr(self, '_is_recon_phase', False):
+                    self._update_recon_dimension_completion(response_text)
 
                 # ★ Check if the LLM performed a verification step
                 # If notes contain "验证成功" or similar, mark flag as verified
@@ -461,6 +568,16 @@ class AgentCore:
                     claimed_flag = getattr(self, '_claimed_flag', None)
                     if not flag_verified or not claimed_flag:
                         # Block termination — force continue
+                        result.should_continue = True
+
+                # ★ Recon phase: block [DONE] if minimum rounds not met or dimensions incomplete
+                # Prevents the LLM from prematurely concluding info gathering
+                if getattr(self, '_is_recon_phase', False) and not result.should_continue:
+                    # Check 1: Minimum rounds not yet reached
+                    if round_num < RECON_MIN_ROUNDS:
+                        result.should_continue = True
+                    # Check 2: Not all active dimensions have been explored
+                    elif not self.context.state.is_recon_complete():
                         result.should_continue = True
                     # ★ IMPORTANT: if flag IS verified and LLM says [DONE], LET IT STOP
                     # This is the key fix — previously _flag_verified never became True,
@@ -720,6 +837,39 @@ class AgentCore:
             # Flag verified — no need for CTF warning, flag_warning already handles it
             pass
 
+        # ★ Recon dimension completion status — prevent premature [DONE]
+        recon_dim_status = ""
+        if getattr(self, '_is_recon_phase', False):
+            dim_status_text = self.context.state.get_recon_status_text()
+            is_complete = self.context.state.is_recon_complete()
+            rounds_no_progress = getattr(self, '_rounds_without_progress', 0)
+            recon_dim_status = (
+                f"\n\n📊 信息收集维度完成度:"
+                f"\n{dim_status_text}"
+            )
+            if not is_complete:
+                recon_dim_status += (
+                    f"\n\n🔴 信息收集未完成！还有维度未检查，禁止标记 [DONE]。"
+                    f"\n请继续对未完成的维度执行检查，确保每个维度都至少做过一轮。"
+                )
+            elif is_complete and rounds_no_progress >= 3:
+                # ★ Force summary: all dims done + no new progress for 3+ rounds
+                recon_dim_status += (
+                    f"\n\n🔴 侦察强制总结指令："
+                    f"\n你已经连续 {rounds_no_progress} 轮没有任何新的工具发现，所有维度均已完成 ✅。"
+                    f"\n请立即执行以下操作（不要继续发送请求）："
+                    f"\n1. 整理已收集的所有侦察信息"
+                    f"\n2. 使用 python_execute 将侦察报告保存到桌面"
+                    f"\n   路径格式: ~/Desktop/{{目标}}_侦察报告_{{日期}}.md"
+                    f"\n3. 在回复末尾添加 [DONE] 标记结束本次侦察"
+                    f"\n⚠️ 禁止继续重复分析已有信息或发送新请求！"
+                )
+            if round_num < RECON_MIN_ROUNDS:
+                recon_dim_status += (
+                    f"\n\n🔴 信息收集最低轮数保障：当前第 {round_num} 轮，"
+                    f"最低需 {RECON_MIN_ROUNDS} 轮。即使觉得够了也请继续深入。"
+                )
+
         return (
             f"\n\n[自主循环 Round {round_num}/{max_rounds}]"
             f"\n当前目标: {state.target or '未设置'}"
@@ -737,6 +887,7 @@ class AgentCore:
             f"{dead_loop_warning}"
             f"{flag_warning}"
             f"{ctf_mode_warning}"
+            f"{recon_dim_status}"
             f"\n\n请基于当前状态和之前所有发现决定下一步操作，持续推进渗透测试。"
             f"\n注意：不要重复之前已经做过的操作，专注于推进到下一步。"
             f"\n如果发现重要线索或完成测试，在回复末尾添加 [DONE] 标记。"
@@ -1287,7 +1438,7 @@ class AgentCore:
                     "properties": {
                         "skill_name": {
                             "type": "string",
-                            "description": "Skill 名称，如 client-reverse, web-security-advanced, ai-mcp-security, intranet-pentest-advanced, pentest-tools, rapid-checklist, crypto-toolkit, ctf-web, ctf-crypto, ctf-misc",
+                            "description": "Skill 名称，如 client-reverse, web-security-advanced, ai-mcp-security, intranet-pentest-advanced, pentest-tools, rapid-checklist, crypto-toolkit, ctf-web, ctf-crypto, ctf-misc, osint-recon",
                         },
                         "reference_name": {
                             "type": "string",
@@ -1515,6 +1666,34 @@ class AgentCore:
             except OSError:
                 pass
             return f"[!] Python 执行错误: {e}"
+
+    def _update_recon_dimension_completion(self, response: str) -> None:
+        """Auto-detect which recon dimensions have been explored based on tool results.
+
+        Only checks tool results (notes and executed_steps from real tool calls),
+        NOT the LLM's reasoning text.
+
+        This prevents false positives where python_execute code snippets contain
+        generic keywords like "github.com" or "email" that would otherwise
+        falsely mark the personnel dimension as complete.
+
+        Once a dimension is marked complete, it stays complete.
+        """
+        # Only check tool results — these are real observations
+        tool_notes = " ".join(self.context.state.notes[-10:]).lower()
+        tool_steps = " ".join(self.context.state.executed_steps[-10:]).lower()
+        tool_context = f"{tool_notes} {tool_steps}"
+
+        # Do NOT include LLM response text — it contains reasoning, not results.
+        # A python_execute code snippet with "github.com" in it should NOT
+        # be treated as actually performing GitHub API research.
+
+        for dim, keywords in _RECON_DIM_KEYWORDS.items():
+            if dim == "personnel" and not self.context.state.recon_dimension4_active:
+                continue
+            if not self.context.state.recon_dimensions_completed.get(dim, False):
+                if any(kw in tool_context for kw in keywords):
+                    self.context.state.mark_recon_dimension(dim)
 
     def _parse_findings(self, response: str) -> None:
         """Parse vulnerability findings and key discoveries from LLM response."""

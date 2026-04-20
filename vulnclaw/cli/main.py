@@ -314,6 +314,10 @@ def _run_repl() -> None:
                             border_style="green" if total_findings == 0 else "red",
                         ))
 
+                        # ★ Auto-save recon report if user requested file output
+                        if "输出" in user_input or "保存" in user_input or "写到" in user_input or "导出" in user_input:
+                            _auto_save_recon_report(agent, user_input, config)
+
                 else:
                     # Single-turn chat
                     async def _run_agent():
@@ -857,31 +861,38 @@ def _should_auto_pentest(user_input: str, current_target: Optional[str]) -> bool
     - User explicitly asks for a full pentest with a target
     - User mentions a target + action keywords like "渗透测试", "打一下"
     - User asks to solve a CTF / find a flag with a target
-    - A target is set and the request is broad (not a specific single-step query)
+    - User asks for information gathering / recon / OSINT with a target
+    - A target is present + multi-step intent indicators
     """
     input_lower = user_input.lower()
 
     # Explicit auto-mode triggers
     auto_keywords = [
+        # 渗透测试
         "渗透测试", "进行渗透", "做渗透", "打一下", "全面测试",
         "pentest", "full test", "auto",
-        # Explicit auto-mode command
         "进入自主渗透模式", "自主渗透模式", "自主模式",
         # CTF / challenge triggers
         "找出flag", "找到flag", "拿flag", "get flag", "find flag",
         "解题", "做题", "挑战", "challenge", "ctf",
         "弱口令", "爆破", "绕过", "bypass", "brute",
+        # ★ 信息收集 / 侦察类
+        "搜集", "收集", "信息收集", "侦察", "recon", "reconnaissance",
+        "社会工程", "社工", "osint", "情报", "intelligence",
+        "分析目标", "目标分析", "资产发现", "目录扫描",
+        "探测", "探索", "调查", "investigate", "enumerate",
+        "全面分析", "深度分析", "详细分析", "全面扫描",
+        "子域名", "子域", "subdomain",
     ]
 
     # Single-step queries should NOT trigger auto mode
     single_step_keywords = [
-        "扫描端口", "端口扫描", "nmap", "port scan",
         "生成报告", "report",
-        "查看", "show", "list", "status",
         "help", "帮助",
     ]
 
     # If it's clearly a single-step query, don't auto-loop
+    # But if it also has auto keywords, still go auto (e.g. "收集信息并生成报告")
     if any(kw in input_lower for kw in single_step_keywords) and not any(kw in input_lower for kw in auto_keywords):
         return False
 
@@ -890,6 +901,17 @@ def _should_auto_pentest(user_input: str, current_target: Optional[str]) -> bool
         # Must have a target (either in input or already set)
         has_target = bool(current_target) or bool(_extract_target_from_input(user_input))
         return has_target
+
+    # ★ Fallback: has target + multi-step intent → auto
+    has_target = bool(current_target) or bool(_extract_target_from_input(user_input))
+    if has_target:
+        multi_step_indicators = [
+            "，", "、", "并", "且", "然后",  # 并列词
+            "输出", "保存", "写到", "导出",  # 输出意图
+            "所有", "全部", "完整", "详细",  # 全面性意图
+        ]
+        if any(ind in input_lower for ind in multi_step_indicators):
+            return True
 
     return False
 
@@ -917,6 +939,77 @@ def main(ctx: typer.Context) -> None:
     """🦞 VulnClaw — AI-powered penetration testing CLI."""
     if ctx.invoked_subcommand is None:
         _run_repl()
+
+
+def _auto_save_recon_report(agent, user_input: str, config) -> None:
+    """Auto-save a recon report after auto_pentest completes when user requested file output."""
+    import os
+    import re
+    from datetime import datetime
+
+    try:
+        state = agent.session_state
+        target = state.target or "unknown"
+
+        # Determine output path
+        # Check if user specified a path
+        path_match = re.search(r'(?:保存到|写到|输出到|导出到)\s*([^\s,，]+)', user_input)
+        if path_match:
+            output_path = path_match.group(1)
+        else:
+            # Default: Desktop
+            desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
+            safe_name = re.sub(r'[^\w]', '_', target)[:30]
+            date_str = datetime.now().strftime('%Y%m%d_%H%M')
+            output_path = os.path.join(desktop, f'{safe_name}_侦察报告_{date_str}.md')
+
+        # Build report content from session state
+        lines = [f"# 🦞 {target} 侦察报告\n"]
+        lines.append(f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+        lines.append(f"> 工具：VulnClaw v0.1.0\n\n---\n")
+
+        # Target info
+        lines.append("## 1. 目标概览\n")
+        lines.append(f"- **目标**：{target}\n")
+        lines.append(f"- **总轮数**：{len(state.executed_steps)}\n")
+        lines.append(f"- **发现漏洞**：{len(state.findings)}\n\n")
+
+        # Findings
+        if state.findings:
+            lines.append("## 2. 发现漏洞\n")
+            for i, f in enumerate(state.findings, 1):
+                lines.append(f"### {i}. [{f.severity}] {f.title}\n")
+                lines.append(f"- **证据**：{f.evidence[:300]}\n")
+                if f.remediation:
+                    lines.append(f"- **修复建议**：{f.remediation}\n")
+                lines.append("")
+
+        # Executed steps
+        if state.executed_steps:
+            lines.append("## 3. 执行步骤\n")
+            for i, step in enumerate(state.executed_steps, 1):
+                step_text = step if isinstance(step, str) else str(step)
+                lines.append(f"{i}. {step_text[:200]}\n")
+            lines.append("")
+
+        # Notes (key observations)
+        if state.notes:
+            lines.append("## 4. 关键观察\n")
+            for note in state.notes:
+                lines.append(f"- {note[:300]}\n")
+            lines.append("")
+
+        lines.append("---\n*本报告由 VulnClaw 自动生成*\n")
+
+        # Write to file
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+
+        console.print(f"\n[+] 侦察报告已保存: {output_path}")
+
+    except Exception as e:
+        console.print(f"\n[!] 自动保存报告失败: {e}")
 
 
 if __name__ == "__main__":

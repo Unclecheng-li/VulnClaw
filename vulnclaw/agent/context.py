@@ -48,6 +48,17 @@ class SessionState(BaseModel):
     # ★ Confirmed facts vs unverified assumptions — critical for CTF reasoning
     confirmed_facts: list[str] = Field(default_factory=list, description="已通过工具验证确认的事实")
     unverified_assumptions: list[str] = Field(default_factory=list, description="推理中基于但未验证的假设")
+    # ★ Recon dimension completion tracking — prevent premature [DONE] in info gathering
+    recon_dimensions_completed: dict[str, bool] = Field(
+        default_factory=lambda: {
+            "server": False,    # 维度一：服务器信息（端口/真实IP/OS/中间件/数据库）
+            "website": False,   # 维度二：网站信息（架构/指纹/WAF/敏感目录/源码泄露/旁站/C段）
+            "domain": False,    # 维度三：域名信息（WHOIS/ICP备案/子域名/DNS/证书透明度）
+            "personnel": False, # 维度四：人员信息（条件触发 — 仅明确社工需求时激活）
+        },
+        description="信息收集四维模型完成度追踪",
+    )
+    recon_dimension4_active: bool = Field(default=False, description="维度四（人员信息）是否被激活")
 
     def add_finding(self, finding: VulnerabilityFinding) -> None:
         """Add a vulnerability finding."""
@@ -70,6 +81,48 @@ class SessionState(BaseModel):
         """Add an unverified assumption."""
         if assumption and assumption not in self.unverified_assumptions:
             self.unverified_assumptions.append(assumption)
+
+    def mark_recon_dimension(self, dimension: str) -> None:
+        """Mark a recon dimension as completed.
+
+        Args:
+            dimension: One of 'server', 'website', 'domain', 'personnel'
+        """
+        if dimension in self.recon_dimensions_completed:
+            self.recon_dimensions_completed[dimension] = True
+
+    def is_recon_complete(self) -> bool:
+        """Check if all active recon dimensions have been completed at least once.
+
+        Dimension 4 (personnel) is only checked if it's been activated.
+        """
+        for dim, completed in self.recon_dimensions_completed.items():
+            if dim == "personnel" and not self.recon_dimension4_active:
+                continue  # Skip inactive dimension 4
+            if not completed:
+                return False
+        return True
+
+    def get_recon_status_text(self) -> str:
+        """Get a human-readable recon dimension completion status."""
+        parts = []
+        dim_names = {
+            "server": "维度一(服务器)",
+            "website": "维度二(网站)",
+            "domain": "维度三(域名)",
+            "personnel": "维度四(人员)",
+        }
+        for dim, completed in self.recon_dimensions_completed.items():
+            if dim == "personnel" and not self.recon_dimension4_active:
+                continue  # Skip inactive dimension 4
+            name = dim_names.get(dim, dim)
+            parts.append(f"{'✅' if completed else '❌'} {name}")
+        incomplete = [dim for dim, done in self.recon_dimensions_completed.items()
+                      if (dim != "personnel" or self.recon_dimension4_active) and not done]
+        status = " | ".join(parts)
+        if incomplete:
+            status += f"\n→ 还有 {len(incomplete)} 个维度未检查，继续收集，不要标记 [DONE]"
+        return status
 
     def advance_phase(self, phase: PentestPhase) -> None:
         """Move to a new phase."""

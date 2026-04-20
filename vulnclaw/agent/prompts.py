@@ -217,6 +217,72 @@ WAF_BYPASS_KNOWLEDGE = """\
 - 通配符：`/bin/ca? /etc/pas?d`
 """
 
+# ── Recon / OSINT Instruction ────────────────────────────────────────
+
+RECON_INSTRUCTION = """\
+## 信息收集四维模型
+
+当目标涉及信息收集/侦察/社会工程/OSINT 时，按以下四个维度系统化执行。
+**每个维度都必须至少做过一轮检查后，才允许标记 [DONE]。**
+
+### 维度一：服务器信息
+- [ ] 开放端口 & 服务版本识别（nmap 全端口扫描或常见端口扫描）
+- [ ] 真实 IP 探测（CDN 后的源站 IP — DNS 历史/全局 Ping/邮件头提取）
+- [ ] 操作系统指纹（TTL 推断 + nmap OS 检测）
+- [ ] 中间件版本（响应头 + 错误页 + 特征文件探测）
+- [ ] 数据库识别（端口探测 + 错误信息 + 特征行为）
+
+### 维度二：网站信息
+- [ ] 网站架构（OS + 中间件 + 数据库 + 语言 + 框架 → 完整技术栈）
+- [ ] Web 指纹（CMS 类型、前端框架、JS 库、模板引擎）
+- [ ] WAF 检测（wafw00f 逻辑 + 响应特征匹配 — WAF 拦截页面/特殊响应头）
+- [ ] 敏感目录 & 敏感文件（常见目录字典 + 状态码筛选 200/403/401）
+- [ ] 源码泄露（.git/.svn/.DS_Store/.env/web.config/备份文件/.bak/.swp/.old）
+- [ ] 旁站查询（同 IP 反查域名 — 同服务器上的其他站点）
+- [ ] C 段查询（同网段存活主机扫描 — 255 个 IP 探测）
+
+### 维度三：域名信息
+- [ ] WHOIS 注册信息（注册人/注册商/NS 服务器/注册日期/到期日期）
+- [ ] ICP 备案信息（工信部备案查询 — 仅中国大陆域名）
+- [ ] 子域名发现（crt.sh + 爆破 + 搜索引擎 + DNS 区域传送）
+- [ ] DNS 记录全量（A/CNAME/MX/TXT/NS/SPF/SOA）
+- [ ] 证书透明度日志（crt.sh / Censys / certspotter）
+
+### 维度四：人员信息 ⚡ 条件触发
+**⚠️ 此维度仅在以下条件之一满足时才执行：**
+- 用户命令中明确提及"社会工程/社工/人员信息/作者追踪/人物画像"等
+- 目标网站有明确作者信息（meta author、about 页面、联系方式）
+
+**不应该做社工的情况**：普通企业官网无个人作者 / 用户只要求"扫描目标" / 目标是 IP/内网地址
+
+- [ ] 姓名 & 职务
+- [ ] 生日 & 联系电话
+- [ ] 邮件地址
+- [ ] 社交媒体账号（B站、微博、知乎、Twitter、LinkedIn、GitHub）
+- [ ] 跨平台关联（用用户名/邮箱搜索其他平台，检查历史提交记录中的邮箱）
+
+### 执行策略
+1. **维度一/二/三始终执行** — 这是渗透测试信息收集的最低标准
+2. **维度四按条件触发** — 见上方触发条件
+3. **先被动后主动** — 先看响应头、DNS、WHOIS（被动），再做端口扫描/目录枚举（主动）
+4. **每轮自检维度完成度** — 在回复中列出哪些维度已检查 ✅，哪些未检查 ❌
+5. **全部维度至少执行一轮后才能标记 [DONE]** — 如果还有 ❌ 维度，继续收集
+
+### ⚠️ 信息收集阶段完成度自检（强制）
+在标记 [DONE] 之前，你必须确认：
+- 维度一：至少完成了端口扫描和真实 IP 探测
+- 维度二：至少完成了 Web 指纹和敏感目录/源码泄露检查
+- 维度三：至少完成了 WHOIS 和子域名发现
+- 维度四：（如果已触发）至少完成了作者标识提取和跨平台关联
+如果任何必做维度未完成，**禁止标记 [DONE]**，继续收集。
+
+### ★ 结果持久化指令
+当用户要求"输出文件"或"保存结果"时：
+- 使用 `python_execute` 工具将结果写入文件
+- 文件路径优先使用用户指定的路径，未指定时保存到桌面
+- 格式：Markdown 报告，包含目录、发现摘要、四维度详细分析
+"""
+
 # ── Auto-Pentest Loop Instruction ────────────────────────────────────
 
 AUTO_PENTEST_INSTRUCTION = """\
@@ -296,6 +362,13 @@ AUTO_PENTEST_INSTRUCTION = """\
 - 确认无重大漏洞 → 总结后 [DONE]
 - 达到最大轮数 → 整理已有发现 [DONE]
 - 用户要求停止 → [DONE]
+- **信息收集完成** → 汇总所有发现、保存报告后 [DONE]
+
+### ★ 结果持久化（完成时必须执行）
+当任务完成或即将 [DONE] 时：
+1. **如果用户要求保存文件** — 使用 `python_execute` 将完整报告写入指定路径
+2. **如果用户未指定但涉及信息收集** — 自动将结果保存到桌面（路径格式：`~/Desktop/目标名_侦察报告_日期.md`）
+3. 报告格式：Markdown，包含目标、发现摘要、详细分析、时间线
 
 ### 🔴 CTF 模式强制规则（当用户要求找 flag 时）
 - **未获取 flag 之前，绝对不能标记 [DONE]**
@@ -395,6 +468,7 @@ def build_system_prompt(
     phase: Optional[str] = None,
     skill_context: Optional[str] = None,
     mcp_tools: Optional[list[dict]] = None,
+    enable_personnel_dim: bool = True,
 ) -> str:
     """Dynamically assemble the full system prompt.
 
@@ -403,6 +477,9 @@ def build_system_prompt(
         phase: Current pentest phase name.
         skill_context: Additional context from loaded Skill.
         mcp_tools: List of available MCP tool schemas.
+        enable_personnel_dim: Whether to include dimension 4 (personnel/social eng)
+            in the RECON_INSTRUCTION. Defaults to True for backward compatibility.
+            Set to False when user has no social engineering intent.
 
     Returns:
         Assembled system prompt string.
