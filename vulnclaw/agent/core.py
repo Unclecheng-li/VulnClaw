@@ -453,6 +453,10 @@ class AgentCore:
         self._same_path_fail_count = 0
         self._path_switch_forced = False
 
+        # ★ Target-level failure tracking: detect repeated failed target access
+        self._failed_targets: dict[str, int] = {}  # {hostname: consecutive_fail_count}
+        self._blocked_targets: set[str] = set()     # targets that should be skipped
+
         # ★ Assumption tracking: help the LLM verify its assumptions
         self._unverified_assumptions = []  # assumptions noted by the agent
 
@@ -599,15 +603,22 @@ class AgentCore:
                 # Record step
                 self.context.state.add_step(f"Round {round_num}: {response_text[:100]}...")
 
+                # ★ Target-level failure tracking: detect repeatedly failed targets
+                blocked_target = self._track_failed_target(response_text)
+
                 # ★ Dead-loop detection: check if we're making progress
                 current_findings = len(self.context.state.findings)
                 current_notes = len(self.context.state.notes)
                 current_steps = len(self.context.state.executed_steps)
-                
+
+                # ★ Only meaningful steps count as progress (not failed retries)
+                last_step = self.context.state.executed_steps[-1] if self.context.state.executed_steps else ""
+                is_meaningful = self._is_meaningful_step(last_step)
+
                 has_new_progress = (
                     current_findings > self._last_findings_count
                     or current_notes > self._last_notes_count
-                    or current_steps > self._last_steps_count + 1  # +1 because we just added a step
+                    or (current_steps > self._last_steps_count + 1 and is_meaningful)
                 )
                 
                 if has_new_progress:
@@ -791,6 +802,22 @@ class AgentCore:
         dead_loop_warning = ""
         rounds_no_progress = getattr(self, '_rounds_without_progress', 0)
         stale_threshold = self.config.session.stale_rounds_threshold
+
+        # ★ Target-level failure warning: if targets are blocked
+        blocked_targets_warning = ""
+        blocked_targets = getattr(self, '_blocked_targets', set())
+        if blocked_targets:
+            targets_str = ", ".join(blocked_targets)
+            blocked_targets_warning = (
+                f"\n\n🚨 **目标不可访问警告**：以下目标已连续多次访问失败，禁止再次尝试："
+                f"\n{chr(10).join(f'  ❌ {t} — 已确认不可达' for t in blocked_targets)}"
+                f"\n\n你必须："
+                f"\n1. 立即停止访问上述目标"
+                f"\n2. 专注于其他存活的目标"
+                f"\n3. 如果没有其他目标，切换到已确认漏洞的深入利用"
+                f"\n4. 不要再浪费轮次尝试连接不可达的目标"
+            )
+
         if rounds_no_progress >= stale_threshold:
             dead_loop_warning = (
                 f"\n\n🔴 严重警告：你已经连续 {rounds_no_progress} 轮没有任何新发现！"
@@ -910,6 +937,7 @@ class AgentCore:
             f"{path_switch_warning}"
             f"{assumption_reminder}"
             f"{python_timeout_warning}"
+            f"{blocked_targets_warning}"
             f"{dead_loop_warning}"
             f"{flag_warning}"
             f"{ctf_mode_warning}"
@@ -985,6 +1013,10 @@ class AgentCore:
         self._same_path_fail_count = 0
         self._path_switch_forced = False
 
+        # ★ Target-level failure tracking for persistent mode
+        self._failed_targets: dict[str, int] = {}
+        self._blocked_targets: set[str] = set()
+
         # ★ Detect CTF mode for persistent pentest too
         ctf_keywords = ["ctf", "flag", "夺旗", "解题", "找flag", "找出flag"]
         self._is_ctf_mode = any(kw in user_input.lower() for kw in ctf_keywords)
@@ -1038,6 +1070,13 @@ class AgentCore:
             new_findings = total_findings - findings_at_cycle_start
             findings_at_cycle_start = total_findings
 
+            # ★ Generate attack path summary with LLM before report
+            llm_summary = ""
+            try:
+                llm_summary = await self._generate_attack_summary()
+            except Exception:
+                pass  # Non-critical, fall back to template parsing
+
             # Generate cycle report
             report_path = None
             if auto_report:
@@ -1050,6 +1089,7 @@ class AgentCore:
                         new_findings=new_findings,
                         total_steps=total_steps,
                         rounds_per_cycle=rounds_per_cycle,
+                        llm_attack_summary=llm_summary,
                     )
                 except Exception as e:
                     report_path = f"报告生成失败: {e}"
@@ -1129,6 +1169,71 @@ class AgentCore:
             if match:
                 return match.group(1)
         return None
+
+    # ★ Target-level failure detection
+    FAILED_ACCESS_PATTERNS = [
+        "SSLError", "ReadTimeout", "连接超时", "连接失败",
+        "502 Bad Gateway", "502", "503", "无法访问", "访问失败",
+        "Connection refused", "ConnectionError", "TimeoutError",
+        "Name or service not known", "No route to host",
+        "SSL: CERTIFICATE_VERIFY_FAILED", "超时",
+    ]
+
+    def _track_failed_target(self, response_text: str) -> Optional[str]:
+        """Track target-level failures and detect repeatedly failed targets.
+
+        Returns the hostname of a blocked target if one is detected, else None.
+        """
+        # Extract hostname from the response
+        import re
+        hostname = None
+        url_match = re.search(r'https?://([^\s/<>"\')\]]+)', response_text)
+        if url_match:
+            hostname = url_match.group(1)
+
+        if not hostname:
+            return None
+
+        # Check if this round's output indicates a failed access attempt
+        is_failed_access = any(pattern in response_text for pattern in self.FAILED_ACCESS_PATTERNS)
+
+        if is_failed_access:
+            self._failed_targets[hostname] = self._failed_targets.get(hostname, 0) + 1
+            # After 3 consecutive failures, block the target
+            if self._failed_targets[hostname] >= 3:
+                self._blocked_targets.add(hostname)
+                return hostname
+        else:
+            # Success or different action — reset counter for this target
+            self._failed_targets[hostname] = 0
+
+        return None
+
+    def _is_meaningful_step(self, step: str) -> bool:
+        """Check if a step represents meaningful progress (not just a failed retry).
+
+        Only steps with actual discoveries or confirmations count as progress.
+        """
+        FAILURE_ONLY_KEYWORDS = [
+            "SSLError", "ReadTimeout", "连接超时", "连接失败",
+            "502 Bad Gateway", "无法访问", "访问失败",
+            "Connection refused", "ConnectionError", "TimeoutError",
+            "超时", "请求失败",
+        ]
+        PROGRESS_KEYWORDS = [
+            "发现", "确认", "漏洞", "端口", "路径",
+            "flag", "成功", "CVE", "泄露", "绕过",
+            "验证通过", "已确认",
+        ]
+
+        # If step only contains failure keywords and no progress keywords,
+        # it's not meaningful progress
+        has_failure = any(kw in step for kw in FAILURE_ONLY_KEYWORDS)
+        has_progress = any(kw in step for kw in PROGRESS_KEYWORDS)
+
+        if has_failure and not has_progress:
+            return False  # Pure failure — not meaningful progress
+        return True
 
     def _detect_attack_path(self, output: str) -> Optional[str]:
         """Detect the current attack path/technique from LLM output.
@@ -1392,6 +1497,63 @@ class AgentCore:
             })
 
         return results
+
+    async def _generate_attack_summary(self) -> str:
+        """Generate an LLM-based attack path summary from conversation history.
+
+        Called before generating the cycle report, so the summary is fresh and
+        reflects the actual content of the conversation.
+        """
+        state = self.context.state
+
+        # Build a concise context for the LLM
+        recent_steps = state.executed_steps[-50:] if state.executed_steps else []
+        findings = state.findings[-10:] if state.findings else []
+        notes = state.notes[-10:] if state.notes else []
+
+        steps_text = "\n".join(f"- {s[:200]}" for s in recent_steps)
+        findings_text = "\n".join(f"- [{f.severity}] {f.title}: {f.description[:100]}" for f in findings)
+        notes_text = "\n".join(f"- {n[:150]}" for n in notes)
+
+        prompt = f"""你是一个渗透测试报告助手。根据以下渗透过程记录，生成一段简洁的中文"攻击路径摘要"：
+
+当前阶段：{state.phase.value}
+已执行步骤数：{len(state.executed_steps)}
+
+最近步骤：
+{steps_text or "(无)"}
+
+已发现漏洞：
+{findings_text or "(无)"}
+
+重要笔记：
+{notes_text or "(无)"}
+
+要求：
+1. 自由发挥，根据实际情况决定详略
+2. 突出关键成果（如发现的漏洞、有效的攻击路径）
+3. 不要罗列步骤，要有总结性
+4. 只输出摘要正文，不要加标题或前缀
+
+示例：
+"已完成信息收集，发现目标服务器为nginx+PHP架构，端口22/80/443开放；正在进行SQL注入测试。"
+
+请生成："""
+
+        try:
+            client = self._get_client()
+            messages = [{"role": "user", "content": prompt}]
+            response = client.chat.completions.create(
+                model=self.config.llm.model,
+                messages=messages,
+                max_tokens=300,
+                temperature=0.3,
+            )
+            if response and response.choices:
+                return response.choices[0].message.content or ""
+        except Exception:
+            pass
+        return ""
 
     @staticmethod
     def _safe_parse_tool_args(arguments: Optional[str]) -> dict:
