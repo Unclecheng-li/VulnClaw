@@ -448,6 +448,10 @@ class AgentCore:
         self._last_steps_count = 0
         self._python_timeout_rounds = 0  # track consecutive rounds with Python timeout
 
+        # ★ Semantic step deduplication: extract operation signature (action+target)
+        # to detect loops even when LLM uses slightly different wording
+        self._seen_step_signatures: set[str] = set()
+
         # ★ Attack path tracking: detect when the agent is stuck on one path
         self._current_attack_path = None  # e.g. "regex_bypass", "rce", "file_inclusion"
         self._same_path_fail_count = 0
@@ -600,8 +604,20 @@ class AgentCore:
                     if self._post_flag_rounds >= 2:
                         result.should_continue = False
 
-                # Record step
-                self.context.state.add_step(f"Round {round_num}: {response_text[:100]}...")
+                # Record step with semantic deduplication
+                # Extract operation signature to detect loops even with different wording
+                # e.g. "领导信箱JavaScript完整参数" vs "领导信箱JavaScript完整参数提取"
+                # both share the same core signature → skip the duplicate
+                step_raw = f"Round {round_num}: {response_text[:100]}..."
+                # Normalize: strip the "Round N:" prefix and truncate, then collapse whitespace
+                sig = re.sub(r'Round\s*\d+:', '', step_raw).strip()[:60].lower()
+                sig = re.sub(r'\s+', '_', sig)
+                sig = re.sub(r'[^\w]', '', sig)  # remove punctuation
+
+                if sig not in self._seen_step_signatures:
+                    self._seen_step_signatures.add(sig)
+                    self.context.state.add_step(step_raw)
+                # else: skip semantically duplicate step (LLM is spinning on same task)
 
                 # ★ Target-level failure tracking: detect repeatedly failed targets
                 blocked_target = self._track_failed_target(response_text)
@@ -611,16 +627,32 @@ class AgentCore:
                 current_notes = len(self.context.state.notes)
                 current_steps = len(self.context.state.executed_steps)
 
+                # ★ Spin-loop detection: if LLM keeps repeating the same type of action
+                # (detected by semantic dedup catching the step, OR notes all sharing
+                # the same core keyword like "领导信箱"), count it as NO real progress
+                is_spinning = False
+                recent_notes = self.context.state.notes[-5:]
+                if recent_notes:
+                    # If the last 3+ notes all contain the same keyword, LLM is spinning
+                    from collections import Counter
+                    all_words = []
+                    for note in recent_notes:
+                        all_words.extend(re.findall(r'[\u4e00-\u9fff]+', note))
+                    if all_words:
+                        word_counts = Counter(all_words)
+                        if word_counts.most_common(1)[0][1] >= 3:
+                            is_spinning = True
+
                 # ★ Only meaningful steps count as progress (not failed retries)
                 last_step = self.context.state.executed_steps[-1] if self.context.state.executed_steps else ""
                 is_meaningful = self._is_meaningful_step(last_step)
 
                 has_new_progress = (
                     current_findings > self._last_findings_count
-                    or current_notes > self._last_notes_count
+                    or (current_notes > self._last_notes_count and not is_spinning)
                     or (current_steps > self._last_steps_count + 1 and is_meaningful)
                 )
-                
+
                 if has_new_progress:
                     self._rounds_without_progress = 0
                     self._python_timeout_rounds = 0  # reset on progress
@@ -1199,13 +1231,17 @@ class AgentCore:
 
         if is_failed_access:
             self._failed_targets[hostname] = self._failed_targets.get(hostname, 0) + 1
-            # After 3 consecutive failures, block the target
+            # After 3 accumulated failures, block the target
             if self._failed_targets[hostname] >= 3:
                 self._blocked_targets.add(hostname)
                 return hostname
         else:
-            # Success or different action — reset counter for this target
-            self._failed_targets[hostname] = 0
+            # Success or different action — decrement counter (don't reset to 0)
+            # A single success shouldn't erase all failure history for this target.
+            # If the target was previously unreachable, partial recovery is noted
+            # but the history persists until fully cleared.
+            if hostname in self._failed_targets and self._failed_targets[hostname] > 0:
+                self._failed_targets[hostname] -= 1
 
         return None
 
@@ -1213,12 +1249,16 @@ class AgentCore:
         """Check if a step represents meaningful progress (not just a failed retry).
 
         Only steps with actual discoveries or confirmations count as progress.
+        A step is considered NOT meaningful only when it is a PURE failure —
+        i.e., it mentions failure indicators AND has no progress indicators at all.
+        If a step has BOTH failure and progress keywords (e.g. "XSS测试超时但发现新路径"),
+        it is still meaningful because progress was made.
         """
         FAILURE_ONLY_KEYWORDS = [
             "SSLError", "ReadTimeout", "连接超时", "连接失败",
             "502 Bad Gateway", "无法访问", "访问失败",
             "Connection refused", "ConnectionError", "TimeoutError",
-            "超时", "请求失败",
+            "请求失败",
         ]
         PROGRESS_KEYWORDS = [
             "发现", "确认", "漏洞", "端口", "路径",
@@ -1226,14 +1266,15 @@ class AgentCore:
             "验证通过", "已确认",
         ]
 
-        # If step only contains failure keywords and no progress keywords,
-        # it's not meaningful progress
-        has_failure = any(kw in step for kw in FAILURE_ONLY_KEYWORDS)
         has_progress = any(kw in step for kw in PROGRESS_KEYWORDS)
+        if has_progress:
+            return True  # Any progress keyword makes it meaningful
 
-        if has_failure and not has_progress:
-            return False  # Pure failure — not meaningful progress
-        return True
+        has_failure = any(kw in step for kw in FAILURE_ONLY_KEYWORDS)
+        if has_failure:
+            return False  # Pure failure with no progress — not meaningful
+
+        return True  # Neither failure nor progress keywords — assume meaningful
 
     def _detect_attack_path(self, output: str) -> Optional[str]:
         """Detect the current attack path/technique from LLM output.
@@ -1408,7 +1449,16 @@ class AgentCore:
             tool_results, skipped_info = await self._handle_tool_calls_with_results(choice.message)
 
             # Build the assistant message dict with ONLY executed tool_calls
-            executed_tcs = [tc["tool_call"] for tc in tool_results]
+            # Defensively validate tool_results structure: each item must have "tool_call" key
+            executed_tcs = []
+            for tc in tool_results:
+                if not isinstance(tc, dict) or "tool_call" not in tc:
+                    # Malformed tool result — skip and log
+                    import sys
+                    print(f"[!] 跳过异常工具结果: {type(tc).__name__} {str(tc)[:100]}", file=sys.stderr)
+                    continue
+                executed_tcs.append(tc["tool_call"])
+
             assistant_msg = {
                 "role": "assistant",
                 "content": choice.message.content or "",
@@ -1427,18 +1477,26 @@ class AgentCore:
             messages.append(assistant_msg)
 
             for tool_result in tool_results:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_result["tool_call_id"],
-                    "content": tool_result["content"],
-                })
+                if isinstance(tool_result, dict) and "tool_call_id" in tool_result:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_result["tool_call_id"],
+                        "content": tool_result.get("content", ""),
+                    })
 
             # ★ Persist tool call results to context so later rounds remember them
             tool_summary_parts = []
             for tc in executed_tcs:
-                tool_summary_parts.append(f"调用工具: {tc.function.name}({tc.function.arguments[:200]})")
+                try:
+                    args_str = str(tc.function.arguments)[:200]
+                except Exception:
+                    args_str = "<无法读取>"
+                tool_summary_parts.append(f"调用工具: {tc.function.name}({args_str})")
             for tr in tool_results:
-                content = tr['content']
+                if not isinstance(tr, dict):
+                    content = str(tr)
+                else:
+                    content = tr.get("content", "")
                 # ★ Improved truncation: keep head + tail (flag usually at the end)
                 if len(content) > 1000:
                     content = content[:500] + "\n...[中间省略]...\n" + content[-500:]
@@ -1527,11 +1585,18 @@ class AgentCore:
             tool_call = item["tool_call"]
             func_name = item["func_name"]
             func_args = item["func_args"]
-            tool_result = await self._execute_mcp_tool(func_name, func_args)
-            results.append({
-                "tool_call_id": tool_call.id,
-                "content": f"[tool:{func_name}] {tool_result}",
-            })
+            try:
+                tool_result = await self._execute_mcp_tool(func_name, func_args)
+                results.append({
+                    "tool_call": tool_call,  # Keep ToolCall object for downstream access
+                    "tool_call_id": tool_call.id,
+                    "content": f"[tool:{func_name}] {tool_result}",
+                })
+            except Exception as e:
+                import sys
+                print(f"[!] 工具执行失败 {func_name}: {e}", file=sys.stderr)
+                # Don't add malformed result — skip this tool call
+                continue
 
         return results, skipped_info
 
@@ -2258,6 +2323,7 @@ class AgentCore:
             matches = re.findall(pattern, response, re.IGNORECASE)
             for match in matches:
                 fact = match.strip()[:200]
+                # ★ 去重检查：避免重复添加相同的 confirmed fact
                 if fact and hasattr(self.context.state, 'add_confirmed_fact'):
                     self.context.state.add_confirmed_fact(fact)
 

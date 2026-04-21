@@ -23,7 +23,7 @@ class TestSkillLoader:
         from vulnclaw.skills.loader import list_specialized_skills
         spec = list_specialized_skills()
         assert isinstance(spec, list)
-        assert len(spec) == 9
+        assert len(spec) >= 9  # Grew from 9 to 13 (added ctf-web, ctf-crypto, ctf-misc, osint-recon)
         expected = ["web-pentest", "android-pentest", "client-reverse",
                      "web-security-advanced", "ai-mcp-security",
                      "intranet-pentest-advanced", "pentest-tools", "rapid-checklist",

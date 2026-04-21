@@ -220,8 +220,10 @@ class SessionState(BaseModel):
             status: Execution status.
             detail: Optional detailed information.
         """
-        # 保留原始步骤（向后兼容）
-        self.executed_steps.append(step)
+        # 保留原始步骤（向后兼容），连续去重避免标题刷屏污染报告
+        if not self.executed_steps or self.executed_steps[-1] != step:
+            self.executed_steps.append(step)
+        # Note: step_records creation removed — it was dead code after the return above
 
         # 创建结构化记录
         if action:

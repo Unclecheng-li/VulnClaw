@@ -14,27 +14,36 @@ class TestReportGenerator:
         state = SessionState(target="192.168.1.100")
         state.advance_phase(PentestPhase.RECON)
         state.advance_phase(PentestPhase.VULN_DISCOVERY)
-        state.add_finding(VulnerabilityFinding(
+        f1 = VulnerabilityFinding(
             title="SQL Injection",
             severity="Critical",
             vuln_type="SQLi",
             description="SQL injection in login form",
             evidence="admin' OR 1=1-- bypassed authentication",
             remediation="Use parameterized queries",
-        ))
-        state.add_finding(VulnerabilityFinding(
+        )
+        f1.verified = True
+        f1.verification_status = "verified"
+        state.add_finding(f1)
+        f2 = VulnerabilityFinding(
             title="Cross-Site Scripting",
             severity="High",
             vuln_type="XSS",
             description="Reflected XSS in search parameter",
             evidence="<script>alert(1)</script>",
-        ))
-        state.add_finding(VulnerabilityFinding(
+        )
+        f2.verified = True
+        f2.verification_status = "verified"
+        state.add_finding(f2)
+        f3 = VulnerabilityFinding(
             title="Information Disclosure",
             severity="Medium",
             vuln_type="Info Leak",
             description="Server version header exposed",
-        ))
+        )
+        f3.verified = True
+        f3.verification_status = "verified"
+        state.add_finding(f3)
         return state
 
     def test_generate_report(self, tmp_path):
@@ -100,7 +109,9 @@ class TestReportGenerator:
         output = str(tmp_path / "report_empty.md")
         generate_report(session, output)
         content = Path(output).read_text(encoding="utf-8")
-        assert "暂无高危发现" in content
+        # Report with no verified findings should mention 0 verified or show summary
+        assert "10.0.0.1" in content
+        assert "已验证漏洞" in content
 
     def test_report_creates_pocs_dir(self, tmp_path):
         from vulnclaw.report.generator import generate_report
