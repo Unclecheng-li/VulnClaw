@@ -1405,9 +1405,10 @@ class AgentCore:
 
         # Handle tool calls — execute them and feed result back
         if choice.message.tool_calls:
-            tool_results = await self._handle_tool_calls_with_results(choice.message)
+            tool_results, skipped_info = await self._handle_tool_calls_with_results(choice.message)
 
-            # Build the assistant message dict with tool_calls for the conversation
+            # Build the assistant message dict with ONLY executed tool_calls
+            executed_tcs = [tc["tool_call"] for tc in tool_results]
             assistant_msg = {
                 "role": "assistant",
                 "content": choice.message.content or "",
@@ -1420,7 +1421,7 @@ class AgentCore:
                             "arguments": tc.function.arguments,
                         },
                     }
-                    for tc in choice.message.tool_calls
+                    for tc in executed_tcs
                 ],
             }
             messages.append(assistant_msg)
@@ -1434,7 +1435,7 @@ class AgentCore:
 
             # ★ Persist tool call results to context so later rounds remember them
             tool_summary_parts = []
-            for tc in choice.message.tool_calls:
+            for tc in executed_tcs:
                 tool_summary_parts.append(f"调用工具: {tc.function.name}({tc.function.arguments[:200]})")
             for tr in tool_results:
                 content = tr['content']
@@ -1442,6 +1443,9 @@ class AgentCore:
                 if len(content) > 1000:
                     content = content[:500] + "\n...[中间省略]...\n" + content[-500:]
                 tool_summary_parts.append(f"工具结果: {content}")
+            # ★ Add skipped info so LLM knows what to retry next round
+            if skipped_info:
+                tool_summary_parts.append(f"⚠️ 本轮跳过: {'; '.join(skipped_info)}")
             self.context.add_assistant_message(" | ".join(tool_summary_parts))
 
             # Second LLM call with tool results
@@ -1476,27 +1480,60 @@ class AgentCore:
 
         return "\n".join(results)
 
-    async def _handle_tool_calls_with_results(self, message) -> list[dict]:
-        """Handle tool calls and return structured results for the conversation.
+    async def _handle_tool_calls_with_results(self, message) -> tuple[list[dict], list[str]]:
+        """Handle tool calls with deduplication and rate limiting.
 
-        Returns a list of dicts with tool_call_id and content, suitable for
-        adding as tool role messages.
+        Returns:
+            (results, skipped_info) — executed results and info about skipped calls.
         """
-        results = []
+        MAX_CALLS_PER_ROUND = 10
+
+        # Step 1: Deduplicate — group by (func_name, args_normalized)
+        seen: dict[str, dict] = {}
         for tool_call in message.tool_calls:
             func_name = tool_call.function.name
-            # Robust JSON parsing — LLM sometimes returns truncated/malformed JSON
             func_args = self._safe_parse_tool_args(tool_call.function.arguments)
+            # Normalize args as key for deduplication
+            args_key = json.dumps(func_args, sort_keys=True, ensure_ascii=False)
+            key = f"{func_name}::{args_key}"
+            if key not in seen:
+                seen[key] = {
+                    "tool_call": tool_call,
+                    "func_name": func_name,
+                    "func_args": func_args,
+                }
 
-            # Route to MCP
+        deduplicated = list(seen.values())
+        total_count = len(message.tool_calls)
+        dedup_count = len(deduplicated)
+
+        # Step 2: Limit execution count
+        to_execute = deduplicated[:MAX_CALLS_PER_ROUND]
+        skipped_calls = deduplicated[MAX_CALLS_PER_ROUND:]
+        skipped_info: list[str] = []
+
+        if total_count > dedup_count:
+            skipped_info.append(f"[去重] {total_count - dedup_count} 个重复调用已合并")
+        if skipped_calls:
+            for sc in skipped_calls:
+                skipped_info.append(
+                    f"[跳过] {sc['func_name']}({str(sc['func_args'])[:100]}) "
+                    f"— 本轮已达上限，下轮继续"
+                )
+
+        # Step 3: Execute
+        results = []
+        for item in to_execute:
+            tool_call = item["tool_call"]
+            func_name = item["func_name"]
+            func_args = item["func_args"]
             tool_result = await self._execute_mcp_tool(func_name, func_args)
-
             results.append({
                 "tool_call_id": tool_call.id,
                 "content": f"[tool:{func_name}] {tool_result}",
             })
 
-        return results
+        return results, skipped_info
 
     async def _generate_attack_summary(self) -> str:
         """Generate an LLM-based attack path summary from conversation history.
