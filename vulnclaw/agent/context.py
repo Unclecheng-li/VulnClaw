@@ -62,22 +62,30 @@ class VulnerabilityFinding(BaseModel):
             self.finding_id = self._generate_finding_id()
 
     def _generate_finding_id(self) -> str:
-        """生成漏洞唯一标识，用于去重."""
-        # 提取 location（从 description 中提取 URL 或路径）
+        """Generate unique vulnerability identifier for deduplication.
+
+        Key improvement: also checks the evidence field (populated by Layer 2
+        auto-detection) in addition to description, since auto-detected findings
+        put URLs/paths in evidence, not description.
+        """
         location = ""
-        if self.description:
-            # 简单提取 URL 或路径
-            url_match = re.search(r'https?://[^\s<>"\')\]]+', self.description)
+        # Try description first, then evidence (Layer 2 auto-findings put URLs there)
+        for field in (self.description, self.evidence):
+            if not field:
+                continue
+            url_match = re.search(r'https?://[^\s<>"\')\]]+', field)
             if url_match:
                 location = url_match.group(0)
-            else:
-                path_match = re.search(r'/[^\s<>"\')\]]+', self.description)
-                if path_match:
-                    location = path_match.group(0)
+                break
+            path_match = re.search(r'/[^\s<>"\')\]]+', field)
+            if path_match:
+                location = path_match.group(0)
+                break
 
-        # 构造唯一 ID: vuln_type + location（取前50字符）
-        key = f"{self.vuln_type}_{location}"[:50]
-        return key
+        # Use vuln_type as dedup key; location only if non-empty (avoids "SQL注入_")
+        if location:
+            return f"{self.vuln_type}_{location}"[:50]
+        return self.vuln_type[:50]
 
     def mark_verified(self, note: str = "") -> None:
         """标记漏洞为已验证."""
@@ -200,6 +208,18 @@ class SessionState(BaseModel):
     def get_pending_findings(self) -> list[VulnerabilityFinding]:
         """获取待验证的漏洞列表."""
         return [f for f in self.findings if f.verification_status == "pending"]
+
+    def add_recon_subdomain(self, subdomain: str) -> None:
+        """Record a discovered subdomain into recon_data['subdomains'].
+
+        The LLM can call this via python_execute when it discovers subdomains
+        during the recon phase (维度三). Subdomains are displayed in the
+        attack surface summary in reports.
+        """
+        if "subdomains" not in self.recon_data:
+            self.recon_data["subdomains"] = []
+        if subdomain and subdomain not in self.recon_data["subdomains"]:
+            self.recon_data["subdomains"].append(subdomain)
 
     def add_step(
         self,
@@ -482,7 +502,19 @@ class SessionState(BaseModel):
         return self.phase.value  # 使用当前阶段
 
     def add_note(self, note: str) -> None:
-        """Add a session note."""
+        """Add a session note, filtering out code/symbol-heavy noise."""
+        import re as _re
+        # Reject notes that are primarily code/symbols — these pollute evidence extraction
+        # and create fake URLs/paths in findings.
+        # Count Chinese characters vs code symbols
+        chinese = _re.findall(r'[\u4e00-\u9fff]', note)
+        code_symbols = _re.findall(r'[{}()=+*/<>\-\\[\\]|;|import |def |return |print\(|requests\.|socket\.|re\.|sys\.]', note)
+        if len(note) > 20 and len(code_symbols) > len(chinese) * 0.5:
+            # Too much code, skip it
+            return
+        # Reject very short notes that are just code symbols or numbers
+        if len(note) < 5 or note in ("---", "**", ">>>", "..."):
+            return
         self.notes.append(note)
 
     def add_confirmed_fact(self, fact: str) -> None:

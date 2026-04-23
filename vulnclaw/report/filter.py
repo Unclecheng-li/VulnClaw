@@ -50,8 +50,12 @@ class ReportContentFilter:
 
     # think 标签（LLM 思考过程）
     THINK_PATTERNS = [
-        re.compile(r'<thinking>[\s\S]*?</thinking>', re.IGNORECASE),
-        re.compile(r'<reasoning>[\s\S]*?</reasoning>', re.IGNORECASE),
+        re.compile(r'</?(?:think|thinking|result_info)>?[\s\S]*?</?(?:think|thinking|result_info)>?', re.IGNORECASE),
+        re.compile(r'</?(?:think|thinking|result_info)>?[\s\S]*', re.IGNORECASE),
+        re.compile(r'<thinking>[\s\S]*?</thinking>?', re.IGNORECASE),
+        re.compile(r'<thinking>[\s\S]*', re.IGNORECASE),
+        re.compile(r'<reasoning>[\s\S]*?</reasoning>?', re.IGNORECASE),
+        re.compile(r'<reasoning>?[\s\S]*', re.IGNORECASE),
         re.compile(r'\[think\]', re.IGNORECASE),
         re.compile(r'##\s*思考\s*', re.IGNORECASE),
         re.compile(r'###\s*推理\s*', re.IGNORECASE),

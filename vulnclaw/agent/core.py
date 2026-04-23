@@ -20,33 +20,48 @@ from vulnclaw.agent.prompts import build_system_prompt, AUTO_PENTEST_INSTRUCTION
 RECON_MIN_ROUNDS = 8  # 信息收集阶段最低轮数，低于此数 [DONE] 被忽略
 
 # Keywords that indicate each recon dimension has been explored
-# ⚠️ These keywords must ONLY appear in tool results (not LLM reasoning text)
-# Personnel dimension uses tool-result-only detection to avoid code snippet false positives
+# ★ Include BOTH tool-result signatures AND natural-language descriptions from notes/confirmed_facts
 _RECON_DIM_KEYWORDS: dict[str, list[str]] = {
     "server": [
+        # Tool-result signatures (exact)
         "端口", "port", "nmap", "开放", "open", "服务版本", "service",
         "真实ip", "real ip", "cdn", "源站", "操作系统", "os检测", "ttl",
         "中间件", "middleware", "数据库", "database", "mysql", "redis",
+        # Natural-language descriptions (broader)
+        "扫描", "端口扫描", "ip地址", "ip探测", "存活主机",
+        "apache", "nginx", "tomcat", "iis", "jetty",
+        "操作系统", "linux", "windows", "ubuntu", "centos",
     ],
     "website": [
+        # Tool-result signatures
         "waf", "web应用防火墙", "敏感目录", "目录扫描", "dirsearch", "gobuster",
         "源码泄露", ".git", ".svn", ".ds_store", ".env", "备份文件", ".bak",
         "旁站", "同ip", "c段", "同网段", "指纹", "cms", "框架", "framework",
         "架构", "技术栈", "web指纹",
+        # Natural-language descriptions (broader)
+        "网站", "web", "javascript", "js文件", "api端点", "api端",
+        "cms", "wordpress", "dedecms", "phpcms", "discuz",
+        "登录", "后台", "管理", "admin", "login",
+        "页面", "url", "目录", "文件",
     ],
     "domain": [
+        # Tool-result signatures
         "whois", "注册人", "注册商", "icp", "备案", "子域名", "subdomain",
         "dns记录", "cname", "mx记录", "txt记录", "证书透明", "crt.sh",
         "证书信息", "ssl证书",
+        # Natural-language descriptions (broader)
+        "域名", "dns", " registr", "注册信息", "icp备案",
+        "子域名", "子站", "crt.sh", "证书",
     ],
     # ⚠️ personnel: 只检测真正的社工行动结果，不靠代码片段中的通用词
-    # "github", "邮箱", "twitter" 等在任何 python_execute 代码中都可能出现
     "personnel": [
         # 真正的 GitHub API 返回结果特征
         "github_id", "followers", "following", "public_repos",
         "unclecheng",  # 从 GitHub API 返回中提取的真实姓名
         # 真正的社工发现结果（不是代码中的字符串）
         "twitter",  # 但必须是 URL 路径中的，不是 import 语句
+        # ★ 扩展：社工相关的自然语言描述
+        "社工", "社会工程", "人员信息", "作者追踪", "人物画像",
     ],
 }
 
@@ -55,21 +70,25 @@ _RECON_DIM_KEYWORDS: dict[str, list[str]] = {
 
 # Closed think blocks: <think>...</think> or <thinking>...</thinking>
 _THINK_CLOSED = re.compile(
-    r"<(?:think|thinking)>.*?</(?:think|thinking)>",
+    r"<(?:think|thinking|<think>|result_info|reasoning)>?.*?</(?:think|thinking|<think>|result_info|reasoning)>?",
     re.DOTALL | re.IGNORECASE,
 )
 
-# Unclosed think blocks: <thinking>... (no closing tag, extends to end of text)
+# Unclosed think blocks: <thinking>... or <think>... (no closing tag, extends to end of text)
 # This is common with DeepSeek R1 and other reasoning models that output
 # <thinking> without a matching </thinking>
+# Note: re.MULTILINE is intentionally omitted — this pattern has no ^/$ anchors,
+# and MULTILINE would make $ match before any newline; combined with the greedy
+# .* (which already matches newlines via DOTALL), $ could cause premature
+# termination when content contains newlines before the true end of string.
 _THINK_UNCLOSED = re.compile(
-    r"<(?:think|thinking)>.*",
+    r"<(?:think|thinking|<think>|reasoning)>?.*",
     re.DOTALL | re.IGNORECASE,
 )
 
 # Opening/closing tag patterns for extracting inner content
-_OPEN_TAG = re.compile(r"^<(?:think|thinking)>", re.IGNORECASE)
-_CLOSE_TAG = re.compile(r"</(?:think|thinking)>$", re.IGNORECASE)
+_OPEN_TAG = re.compile(r"^<(?:think|thinking|reasoning)>?", re.IGNORECASE)
+_CLOSE_TAG = re.compile(r"</?(?:think|thinking|reasoning)>?$", re.IGNORECASE)
 
 
 def strip_think_tags(text: str) -> str:
@@ -307,6 +326,82 @@ class AgentCore:
 
         return None
 
+    def _extract_user_vuln_hint(self, user_input: str) -> str:
+        """Extract explicit vulnerability hints from user input.
+
+        When the user says "这个点有SQL注入，测试一下" or "帮我测一下XSS"，
+        returns a directive telling LLM to test that specific vuln immediately.
+        Returns "" if no explicit hint found.
+        """
+        # Known vulnerability keywords to look for
+        vuln_keywords = [
+            "SQL注入", "SQLi", "XSS", "RCE", "命令注入",
+            "文件包含", "路径遍历", "LFI", "RFI",
+            "SSRF", "CSRF", "弱口令", "暴力破解",
+            "认证绕过", "未授权", "信息泄露", "敏感信息泄露",
+        ]
+
+        user_lower = user_input.lower()
+        found_vulns = [v for v in vuln_keywords if v.lower() in user_lower]
+        if not found_vulns:
+            return ""
+
+        # Try to extract URL/path from user input
+        url_match = re.search(r'https?://\S+', user_input)
+        path_match = re.search(r'/[\w\-./?=&%#]+', user_input)
+        target = url_match.group(0) if url_match else (path_match.group(0) if path_match else "")
+
+        vuln_str = "/".join(found_vulns[:3])
+        if target:
+            # Provide specific payload templates for each vuln type
+            payload_examples = self._get_payload_examples(found_vulns, target)
+            directive = (
+                f"【用户明确提示 — 第1轮】\n"
+                f"用户明确告诉你 【{target}】 存在 【{vuln_str}】 漏洞。\n"
+                f"\n"
+                f"→ 你必须立即构造并发送 PoC 测试请求！\n"
+                f"→ 用 fetch 工具直接发送请求，观察真实响应！\n"
+                f"→ 不要先探索路径、不要先做信息收集，直接测漏洞！\n"
+                f"\n"
+                f"{payload_examples}"
+            )
+        else:
+            directive = (
+                f"【用户明确提示】\n"
+                f"用户要求你测试 【{vuln_str}】 漏洞。\n"
+                f"→ 立即基于已发现的目标信息构造 PoC 测试，不要先做额外信息收集！"
+            )
+        return directive
+
+    @staticmethod
+    def _get_payload_examples(found_vulns: list[str], target: str) -> str:
+        """Return concrete PoC payload examples for the given vulnerability types."""
+        lines = ["【PoC payload 示例】"]
+        for v in found_vulns[:2]:  # limit to 2 vuln types to avoid overload
+            if "SQL" in v:
+                lines.append(f"SQL注入测试（布尔盲注）:")
+                lines.append(f"  GET {target}?id=1' AND 1=1--  → 观察响应长度")
+                lines.append(f"  GET {target}?id=1' AND 1=2--  → 长度是否不同？")
+                lines.append(f"SQL注入测试（报错注入）:")
+                lines.append(f"  GET {target}?id=1' AND EXTRACTVALUE(1,CONCAT(0x7e,version()))--")
+            elif "XSS" in v:
+                lines.append(f"XSS测试:")
+                lines.append(f"  GET {target}?q=<script>alert(1)</script>  → 页面是否回显该内容")
+                lines.append(f"  GET {target}?q=<img src=x onerror=alert(1)>")
+            elif "RCE" in v or "命令注入" in v:
+                lines.append(f"RCE/命令注入测试:")
+                lines.append(f"  GET {target}?cmd=whoami  → 观察是否有命令输出")
+                lines.append(f"  GET {target}?c=whoami  → 不同参数名都试")
+            elif "文件包含" in v or "路径遍历" in v:
+                lines.append(f"文件包含/路径遍历测试:")
+                lines.append(f"  GET {target}?f=/etc/passwd  → 读取系统文件")
+                lines.append(f"  GET {target}?f=../../../../etc/passwd")
+            elif "SSRF" in v:
+                lines.append(f"SSRF测试:")
+                lines.append(f"  GET {target}?url=http://127.0.0.1  → 是否有响应")
+                lines.append(f"  GET {target}?url=http://169.254.169.254/latest/meta-data/")
+        return "\n".join(lines[:12])  # max 12 lines
+
     def _detect_target(self, user_input: str) -> Optional[str]:
         """Extract target from user input."""
         # Try to find URL (with optional port)
@@ -419,6 +514,14 @@ class AgentCore:
         # ── Skill dispatch: determine the best Skill for this task ──
         # We dispatch once based on the initial input and reuse it for all rounds
         self._auto_skill_input = user_input
+
+        # ★ User vulnerability hint detection: extract explicit vuln hints from user input
+        # When the user says "这个点有SQL注入" or "测试一下XX漏洞"，prioritize it
+        self._user_vuln_hint = self._extract_user_vuln_hint(user_input)
+
+        # Add user hint to system prompt in early rounds so LLM doesn't miss it
+        if self._user_vuln_hint:
+            self._user_vuln_hint_rounds = 3  # inject for first 3 rounds
 
         # Reset flag verification state for this run
         self._claimed_flag = None
@@ -722,6 +825,19 @@ class AgentCore:
             for f in state.findings[-5:]:  # Show last 5 findings
                 findings_summary += f"\n  - [{f.severity}] {f.title}: {f.evidence[:100]}"
 
+        # ★ User vuln hint injection: when user explicitly hints "这个点有XX漏洞"
+        # inject a direct "test it now" directive for the first few rounds
+        user_hint_directive = ""
+        if (round_num <= getattr(self, '_user_vuln_hint_rounds', 0)
+                and getattr(self, '_user_vuln_hint', None)):
+            user_hint_directive = (
+                f"\n\n{'='*50}\n"
+                f"【用户明确提示 — 第 {round_num}/{getattr(self, '_user_vuln_hint_rounds', 0)} 轮】\n"
+                f"{self._user_vuln_hint}\n"
+                f"{'='*50}\n"
+            )
+            self._user_vuln_hint_rounds -= 1  # decrement so it expires after N rounds
+
         steps_summary = ""
         if state.executed_steps:
             # Show recent steps in more detail
@@ -924,14 +1040,22 @@ class AgentCore:
                     f"\n\n🔴 信息收集未完成！还有维度未检查，禁止标记 [DONE]。"
                     f"\n请继续对未完成的维度执行检查，确保每个维度都至少做过一轮。"
                 )
-            elif is_complete and rounds_no_progress >= 3:
-                # ★ Force transition to exploitation: all dims done + no new progress for 3+ rounds
-                #   Previously this told LLM to save a report + [DONE], keeping it stuck in recon.
-                #   Now it forces the agent into VULN_DISCOVERY / EXPLOITATION.
+            elif (is_complete and rounds_no_progress >= 3) or \
+                 (rounds_no_progress >= RECON_MIN_ROUNDS + 5):
+                # ★ Force transition to exploitation — two trigger paths:
+                #   Path A: all dims done + no new progress for 3+ rounds
+                #   Path B (safety valve): no progress for RECON_MIN_ROUNDS+5 rounds
+                #       even if dimensions aren't formally marked complete.
+                #       This prevents the bug where dimension keywords never fire
+                #       but LLM has clearly been doing recon for many rounds.
                 output_dir = str(self.config.session.output_dir.resolve())
+                if is_complete:
+                    trigger_reason = f"所有维度均已完成 ✅，连续 {rounds_no_progress} 轮无新进展"
+                else:
+                    trigger_reason = f"连续 {rounds_no_progress} 轮无新进展（{RECON_MIN_ROUNDS}+5 安全阀）"
                 recon_dim_status += (
                     f"\n\n🔴 ★★★ 侦察→利用阶段强制切换 ★★★\n"
-                    f"所有维度均已完成 ✅，连续 {rounds_no_progress} 轮无新进展。\n"
+                    f"{trigger_reason}。\n"
                     f"你必须立即切换到【漏洞利用阶段】，而不是继续收集信息或保存报告。\n\n"
                     f"★ 立即执行以下操作：\n"
                     f"1. 在回复中输出「切换到漏洞发现」或「阶段: vuln_discovery」\n"
@@ -939,10 +1063,6 @@ class AgentCore:
                     f"   对最高价值的攻击面实施实际的漏洞利用\n"
                     f"3. 【禁止】继续保存侦察报告或调用信息收集类工具\n"
                     f"4. 【禁止】重复已有的发现，必须有新的实际验证步骤\n\n"
-                    f"★ 最高优先级目标（基于侦察结果）：\n"
-                    f"   - shenbao.conac.cn 的 /guest/checkuser 用户枚举 → 实际验证枚举效果\n"
-                    f"   - shenbao.conac.cn 的 /net-id-api/captcha → 验证验证码是否能被破解\n"
-                    f"   - 对发现的旁站进行针对性漏洞测试\n\n"
                     f"★ 输出目录（侦察报告由框架自动保存，不需要你手动保存）：\n"
                     f"   {output_dir}\n"
                     f"⚠️ 本次渗透的目标是【实际漏洞利用成功】，不是侦察报告！"
@@ -958,6 +1078,7 @@ class AgentCore:
             f"\n当前目标: {state.target or '未设置'}"
             f"\n当前阶段: {state.phase.value}"
             f"\n输出目录: {self.config.session.output_dir.resolve()}"
+            f"{user_hint_directive}"   # ★ 用户漏洞提示：前3轮注入，直接告诉 LLM 要测什么漏洞
             f"{findings_summary}"
             f"{facts_summary}"
             f"{assumptions_summary}"
@@ -1318,6 +1439,9 @@ class AgentCore:
         
         Returns the response text with thinking tags preserved for
         later processing by format_think_tags/strip_think_tags.
+
+        Note: <thinking> (XML-style) is the primary format. <result_info> blocks
+        are handled separately as tool call metadata and do not need here.
         """
         content = message.content or ""
         
@@ -1601,46 +1725,45 @@ class AgentCore:
         return results, skipped_info
 
     async def _generate_attack_summary(self) -> str:
-        """Generate an LLM-based attack path summary from conversation history.
+        """Generate a detailed attack path summary for the cycle report.
 
-        Called before generating the cycle report, so the summary is fresh and
-        reflects the actual content of the conversation.
+        Provides all execution steps, notes, and findings to the LLM and asks
+        for a detailed narrative of the attack chain with specific URLs/techniques.
         """
         state = self.context.state
 
-        # Build a concise context for the LLM
-        recent_steps = state.executed_steps[-50:] if state.executed_steps else []
-        findings = state.findings[-10:] if state.findings else []
-        notes = state.notes[-10:] if state.notes else []
+        # Collect all execution steps
+        steps = state.executed_steps[-30:] if state.executed_steps else []
+        steps_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps)) if steps else "（无步骤记录）"
 
-        steps_text = "\n".join(f"- {s[:200]}" for s in recent_steps)
-        findings_text = "\n".join(f"- [{f.severity}] {f.title}: {f.description[:100]}" for f in findings)
-        notes_text = "\n".join(f"- {n[:150]}" for n in notes)
+        # Collect all notes/observations
+        notes = state.notes[-20:] if state.notes else []
+        notes_text = "\n".join(f"- {n}" for n in notes) if notes else "（无观察记录）"
 
-        prompt = f"""你是一个渗透测试报告助手。根据以下渗透过程记录，生成一段简洁的中文"攻击路径摘要"：
+        # Findings with evidence
+        findings = state.findings
+        if findings:
+            lines = []
+            for f in findings:
+                ev = (f.evidence or "")[:150].strip()
+                lines.append(f"[{f.severity}] {f.title} | 证据: {ev or '无'}")
+            findings_text = "\n".join(lines)
+        else:
+            findings_text = "无"
 
-当前阶段：{state.phase.value}
-已执行步骤数：{len(state.executed_steps)}
-
-最近步骤：
-{steps_text or "(无)"}
-
-已发现漏洞：
-{findings_text or "(无)"}
-
-重要笔记：
-{notes_text or "(无)"}
-
-要求：
-1. 自由发挥，根据实际情况决定详略
-2. 突出关键成果（如发现的漏洞、有效的攻击路径）
-3. 不要罗列步骤，要有总结性
-4. 只输出摘要正文，不要加标题或前缀
-
-示例：
-"已完成信息收集，发现目标服务器为nginx+PHP架构，端口22/80/443开放；正在进行SQL注入测试。"
-
-请生成："""
+        prompt = (
+            f"目标：{state.target or '?'}  |  当前阶段：{state.phase.value}\n"
+            f"\n=== 已执行步骤 ===\n{steps_text}\n"
+            f"\n=== 关键观察/结果 ===\n{notes_text}\n"
+            f"\n=== 漏洞发现 ===\n{findings_text}\n\n"
+            f"请输出一段详细的中文攻击路径叙事，包含以下要素：\n"
+            f"1. 具体测试过的 URL/路径（如 https://target.com/admin/login）\n"
+            f"2. 每步使用的具体技术/工具（如 SQLMap 盲注、目录枚举、nmap 端口扫描）\n"
+            f"3. 关键响应特征（如差异长度155字节、HTTP 500错误回显）\n"
+            f'4. 漏洞与攻击面的关联（如通过目录枚举发现 /manager/html，命中 CVE-2023-44487）\n'
+            f"5. 子域名发现情况（如发现 api.target.com、cms.target.com 等）\n"
+            f"格式要求：用自然段落叙事，不用列表，长度 200-400 字，纯中文，不含 <thinking> 标签。"
+        )
 
         try:
             client = self._get_client()
@@ -1648,11 +1771,13 @@ class AgentCore:
             response = client.chat.completions.create(
                 model=self.config.llm.model,
                 messages=messages,
-                max_tokens=300,
+                max_tokens=800,
                 temperature=0.3,
             )
             if response and response.choices:
-                return response.choices[0].message.content or ""
+                raw = response.choices[0].message.content or ""
+                # Strip any residual think tags from the summary itself
+                return strip_think_tags(raw).strip()
         except Exception:
             pass
         return ""
@@ -1953,8 +2078,21 @@ class AgentCore:
         if not target:
             return "[!] nmap_scan 需要 target 参数（目标 IP 或域名）"
 
-        # Warn if target resolves to a reserved/internal IP
-        ip_warning = self._validate_scan_target(target)
+        # ★ Skip nmap for reserved/internal IPs — these waste rounds and produce meaningless results
+        import socket
+        try:
+            ips = socket.getaddrinfo(target, None, socket.AF_INET)
+            if ips:
+                ip = ips[0][4][0]
+                is_reserved, reason = self._is_reserved_ip(ip)
+                if is_reserved:
+                    return (
+                        f"[SKIP] 目标 {target} 解析到保留/内网地址 ({reason}, IP: {ip})\n"
+                        f"跳过 nmap 扫描。建议直接通过 Web 指纹、目录枚举等方法收集信息，"
+                        f"不要在保留地址上浪费轮次。"
+                    )
+        except Exception:
+            pass
 
         scan_type = args.get("scan_type", "top_ports")
         custom_ports = args.get("ports", "")
@@ -2019,7 +2157,7 @@ class AgentCore:
             return f"[!] nmap 扫描失败（{result.returncode}）: {result.stderr[:500]}"
 
         scan_result = self._parse_nmap_xml(result.stdout or result.stderr, target)
-        return ip_warning + scan_result
+        return scan_result
 
     # ── Reserved IP detection helpers ─────────────────────────────────
 
@@ -2144,14 +2282,25 @@ class AgentCore:
     async def _execute_python(self, args: dict) -> str:
         """Execute a Python code snippet in a sandboxed subprocess.
 
-        The code runs with a 30-second timeout. stdout and stderr are
-        captured and returned to the LLM.
+        The code runs with a timeout (30s default, 60s for recon/info-gathering scripts).
+        stdout and stderr are captured and returned to the LLM.
         """
         code = args.get("code", "")
         purpose = args.get("purpose", "")
 
         if not code.strip():
             return "[!] 代码为空，未执行"
+
+        # ★ Determine timeout based on purpose
+        # Recon/info-gathering scripts often need more time for API enumeration
+        _RECON_PURPOSE_KEYWORDS = [
+            "recon", "信息收集", "侦察", "枚举", "扫描", "crawl", "spider",
+            "目录", "子域名", "端口", "指纹", "收集",
+        ]
+        timeout_seconds = 30
+        purpose_lower = purpose.lower()
+        if any(kw in purpose_lower for kw in _RECON_PURPOSE_KEYWORDS):
+            timeout_seconds = 60
 
         # Sandbox safety: block dangerous patterns
         for pattern in self._BLOCKED_PATTERNS:
@@ -2196,7 +2345,7 @@ class AgentCore:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
-                    timeout=30,
+                    timeout=timeout_seconds,
                     cwd=tempfile.gettempdir(),
                     env={**os.environ, "PYTHONIOENCODING": "utf-8"},
                 ),
@@ -2240,7 +2389,7 @@ class AgentCore:
             except OSError:
                 pass
             self._python_timeout_rounds = getattr(self, '_python_timeout_rounds', 0) + 1
-            return "[!] Python 执行超时（30秒），请简化代码或分步执行，禁止写超过10行的复杂脚本"
+            return f"[!] Python 执行超时（{timeout_seconds}秒），请简化代码或分步执行，禁止写超过10行的复杂脚本"
         except Exception as e:
             try:
                 os.unlink(tmp_path)
@@ -2249,54 +2398,246 @@ class AgentCore:
             return f"[!] Python 执行错误: {e}"
 
     def _update_recon_dimension_completion(self, response: str) -> None:
-        """Auto-detect which recon dimensions have been explored based on tool results.
+        """Auto-detect which recon dimensions have been explored.
 
-        Only checks tool results (notes and executed_steps from real tool calls),
-        NOT the LLM's reasoning text.
+        Checks three sources:
+        1. notes (LLM's natural-language descriptions of discoveries)
+        2. confirmed_facts (verified tool results)
+        3. executed_steps (step log)
 
-        This prevents false positives where python_execute code snippets contain
-        generic keywords like "github.com" or "email" that would otherwise
-        falsely mark the personnel dimension as complete.
+        This fixes the previous bug where only tool_result signatures were checked,
+        causing dimensions to never mark complete when LLM describes findings in
+        natural language (notes) rather than tool-result keywords.
 
         Once a dimension is marked complete, it stays complete.
         """
-        # Only check tool results — these are real observations
-        tool_notes = " ".join(self.context.state.notes[-10:]).lower()
-        tool_steps = " ".join(self.context.state.executed_steps[-10:]).lower()
-        tool_context = f"{tool_notes} {tool_steps}"
-
-        # Do NOT include LLM response text — it contains reasoning, not results.
-        # A python_execute code snippet with "github.com" in it should NOT
-        # be treated as actually performing GitHub API research.
+        # Combine notes + confirmed_facts + steps for dimension detection
+        # notes = LLM's natural-language descriptions (rich but not tool-result exact)
+        # confirmed_facts = verified discoveries (high signal)
+        # steps = operation log (contextual)
+        note_text = " ".join(self.context.state.notes[-15:]).lower()
+        fact_text = " ".join(getattr(self.context.state, 'confirmed_facts', [])[-15:]).lower()
+        step_text = " ".join(self.context.state.executed_steps[-15:]).lower()
+        full_context = f"{note_text} {fact_text} {step_text}"
 
         for dim, keywords in _RECON_DIM_KEYWORDS.items():
             if dim == "personnel" and not self.context.state.recon_dimension4_active:
                 continue
             if not self.context.state.recon_dimensions_completed.get(dim, False):
-                if any(kw in tool_context for kw in keywords):
+                if any(kw.lower() in full_context for kw in keywords):
                     self.context.state.mark_recon_dimension(dim)
 
+    # ── Natural-language vulnerability title patterns ──────────────────────
+    # These detect LLM's natural-language vulnerability descriptions so we can
+    # auto-generate findings WITHOUT requiring [Critical]/[High] tags.
+    # ★ CRITICAL REQUIREMENT: Layer 2 ONLY creates a finding if both:
+    #   (a) a vuln keyword matches AND
+    #   (b) actual proof indicators are present in the response (HTTP diffs, errors, etc.)
+    # This prevents false positives from LLM reasoning text alone.
+    #
+    # Proof indicators that must accompany a vuln keyword to create a finding:
+    #   - "差异 \d+" or "差异:\d+"  → HTTP response length difference
+    #   - "bytes|\d+字节|长度:\d+"     → response size mention
+    #   - "500错误|SQL error|mysql"   → server error message
+    #   - "SLEEP(|BENCHMARK("         → time-based blind injection
+    #   - "EXTRACTVALUE(|UPDATEXML("  → error-based SQL injection
+    #   - "命令执行成功|whoami|id"     → command execution output
+    #   - "root|xampp|apache"         → internal system info leaked
+    #
+    _PROOF_PATTERNS = [
+        r'差异[：:]*\s*\d+',          # 差异:155 / 差异 306
+        r'\d+\s*bytes|\d+\s*字节',    # 52095 bytes / 长度 52095
+        r'(?:状态|响应)?[码代码]*[:：]*\s*5\d{2}',  # 500错误 / 状态码:500
+        r'SQL.*错误|mysql.*error|sql.*error',
+        r'SLEEP\(|BENCHMARK\(|EXTRACTVALUE\(|UPDATEXML\(',
+        r'命令执行成功|whoami|id\s+',
+        r'root[:\s]|administrator',   # privilege indicator
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}',  # internal IP leaked
+        r'CVE-\d{4}-\d{4,}',         # CVE mentioned (already a strong signal)
+        r'成功提取|成功获取|获取到',   # data extraction success
+    ]
+
+    _NATURAL_LANG_PATTERNS = [
+        # ── Critical / High severity ──────────────────────────────────────
+        (r'SQL注入|SQLi|注入漏洞', "High", "SQL注入"),
+        (r'RCE|远程代码执行|命令注入|命令执行', "Critical", "远程代码执行"),
+        (r'未授权|未认证|无需认证|认证绕过|认证.*绕过', "High", "认证绕过"),
+        (r'SSRF|服务端请求伪造', "High", "SSRF"),
+        # ── Medium severity ───────────────────────────────────────────────
+        (r'XSS|跨站脚本|存储型XSS|反射型XSS', "Medium", "XSS跨站脚本"),
+        (r'CSRF|跨站请求伪造', "Medium", "CSRF"),
+        (r'文件包含|路径遍历|LFI|RFI', "Medium", "文件包含/遍历"),
+        (r'弱口令|默认口令|默认密码|暴力破解|爆破', "Medium", "弱口令/暴力破解"),
+        (r'配置错误|配置缺陷|泄露.*配置', "Medium", "配置错误"),
+        # ── Low / Info ───────────────────────────────────────────────
+        (r'敏感目录|敏感文件.*发现|目录.*发现', "Info", "敏感目录/文件发现"),
+        (r'版本.*旧|中间件版本|指纹.*识别', "Info", "版本信息"),
+        (r'CVE-\d{4}-\d{4,}', "High", "已知CVE漏洞"),
+    ]
+
+    # ── Security-relevant keywords for note→finding elevation ──────────────
+    # When these appear in confirmed_facts or notes, auto-create a finding
+    _ELEVATION_KEYWORDS = [
+        (r'泄露|敏感信息|数据泄露|个人信息|\d+条数据', "High", "数据泄露"),
+        (r'未授权|未认证|认证绕过|无需认证', "High", "未授权访问"),
+        (r'RCE|命令执行|远程代码', "Critical", "远程代码执行"),
+        (r'SQL注入|SQLi|注入', "High", "注入漏洞"),
+        (r'CVE-\d{4}-\d{4,}', "High", "已知CVE漏洞"),
+        (r'弱口令|默认口令|暴力', "High", "弱口令/暴力破解"),
+        (r'XSS|跨站脚本', "Medium", "XSS"),
+        (r'文件包含|路径遍历', "High", "文件包含/遍历"),
+        (r'返回200.*但.*不存在|200.*空内容|空响应.*但', "Medium", "潜在授权绕过"),
+        (r'403.*接口|接口存在.*403', "Medium", "403认证拦截"),
+    ]
+
     def _parse_findings(self, response: str) -> None:
-        """Parse vulnerability findings and key discoveries from LLM response."""
+        """Parse vulnerability findings and key discoveries from LLM response.
+
+        Three-layer detection:
+        1. Explicit [Severity] tags (existing, still valid)
+        2. Natural-language vulnerability descriptions → auto-create findings
+        3. Note/confirmed_fact elevation → high-confidence facts become findings
+        """
         from vulnclaw.agent.context import VulnerabilityFinding
 
-        # Simple heuristic: look for severity markers
+        existing_titles = {f.title for f in self.context.state.findings}
+
+        # ── Layer 1: Explicit severity tags (existing) ─────────────────────
         patterns = [
             (r'\[Critical\]\s*(.+?)(?:\n|$)', "Critical"),
             (r'\[High\]\s*(.+?)(?:\n|$)', "High"),
             (r'\[Medium\]\s*(.+?)(?:\n|$)', "Medium"),
             (r'\[Low\]\s*(.+?)(?:\n|$)', "Low"),
         ]
-
         for pattern, severity in patterns:
-            matches = re.findall(pattern, response)
-            for match in matches:
-                self.context.state.add_finding(VulnerabilityFinding(
-                    title=match.strip(),
-                    severity=severity,
-                ))
+            for match in re.findall(pattern, response):
+                title = match.strip()
+                # Clean markdown artifacts from LLM output (e.g. "漏洞** - " → "漏洞")
+                title = re.sub(r'\*+', '', title).strip(' -–—:')
+                if title and title not in existing_titles:
+                    self.context.state.add_finding(VulnerabilityFinding(
+                        title=title,
+                        severity=severity,
+                    ))
+                    existing_titles.add(title)
 
-        # Extract key discoveries and record as notes for context persistence
+        # ── Layer 2: Natural-language vulnerability detection ───────────────
+        # LLM describes vulnerabilities in natural Chinese without [Tag] format.
+        # Key fix: use vuln_type as the canonical title (dedup key) rather than
+        # the raw regex match, because:
+        #   1. Patterns without capture groups → match is the full string (too long)
+        #   2. Same vuln type can match multiple wordings → duplicate findings
+        #   3. vuln_type is a curated, human-readable category name
+        # We still extract the first matching snippet as a description detail.
+        #
+        # Enhancement: also extract URLs/paths from response and recent notes
+        # to populate the evidence field, so findings aren't just titles.
+        _URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
+        # Require at least one alphanumeric segment to avoid Chinese text with slashes
+        _PATH_RE = re.compile(r'(?:/[\w%&=?\-]+)+')
+
+        # Build evidence pool from response + recent notes
+        # Strip think tags to avoid picking up LLM reasoning text as evidence
+        clean_response = strip_think_tags(response)
+        notes = self.context.state.notes
+        if notes:
+            clean_notes = [strip_think_tags(n) for n in notes[-5:]]
+            evidence_pool = clean_response + " " + " ".join(clean_notes)
+        else:
+            evidence_pool = clean_response
+
+        for pattern, severity, vuln_type in self._NATURAL_LANG_PATTERNS:
+            canonical_title = f"[自动] {vuln_type}"
+            if canonical_title in existing_titles:
+                continue  # Already found this type — skip
+
+            # ── Layer 2A: Check if vuln keyword appears in response ────────
+            vuln_matches = re.findall(pattern, clean_response, re.IGNORECASE)
+            if not vuln_matches:
+                continue
+
+            # ── Layer 2B: Require proof indicators before creating a finding ──
+            # Without actual HTTP response evidence (diff/error/data), the LLM is just
+            # speculating. Don't create a finding from pure reasoning.
+            # STRICT mode: require proof OR confirmed_facts — no evidence = no finding.
+            has_proof = any(
+                re.search(p, clean_response + " " + " ".join(notes[-3:]), re.IGNORECASE)
+                for p in self._PROOF_PATTERNS
+            )
+            # Also check confirmed_facts (verified by tool results)
+            has_confirmed_fact = any(
+                re.search(p, " ".join(getattr(self.context.state, 'confirmed_facts', [])), re.IGNORECASE)
+                for p in self._PROOF_PATTERNS
+            )
+            if not has_proof and not has_confirmed_fact:
+                # LLM is speculating — skip creating this finding entirely.
+                # Do NOT create pending findings without any evidence.
+                continue
+
+            # ── Extract actual proof snippets as evidence ──────────────────────
+            proof_snippets = []
+            for p in self._PROOF_PATTERNS:
+                for m in re.finditer(p, evidence_pool, re.IGNORECASE):
+                    snippet = m.group(0).strip()[:80]
+                    if snippet and snippet not in proof_snippets:
+                        proof_snippets.append(snippet)
+                    if len(proof_snippets) >= 3:
+                        break
+
+            # ── Extract URLs/paths from evidence pool for location ──────────
+            urls = re.findall(_URL_RE, evidence_pool)
+            paths = re.findall(_PATH_RE, evidence_pool)
+            seen, unique_urls, unique_paths = set(), [], []
+            for u in urls:
+                if u not in seen:
+                    seen.add(u)
+                    unique_urls.append(u)
+            for p in paths:
+                if p not in seen:
+                    seen.add(p)
+                    unique_paths.append(p)
+
+            location = " | ".join(unique_urls[:2] + unique_paths[:2])
+            proof_text = " | ".join(proof_snippets) if proof_snippets else ""
+            evidence = (location + " | " + proof_text) if proof_text else location
+
+            self.context.state.add_finding(VulnerabilityFinding(
+                title=canonical_title,
+                severity=severity,
+                vuln_type=vuln_type,
+                description=f"自动检测：{vuln_matches[0].strip()[:100]}" if vuln_matches else "通过自然语言模式自动检测",
+                evidence=evidence[:300],
+            ))
+            existing_titles.add(canonical_title)
+
+        # ── Layer 3: confirmed_facts → findings elevation ──────────────────
+        # High-confidence verified facts become findings AND are auto-marked verified
+        # because they come from confirmed tool output, not just LLM reasoning.
+        confirmed_facts = getattr(self.context.state, 'confirmed_facts', [])
+        for fact in confirmed_facts:
+            for pattern, severity, vuln_type in self._ELEVATION_KEYWORDS:
+                if re.search(pattern, fact, re.IGNORECASE):
+                    title = f"[已确认] {fact.strip()[:120]}"
+                    if title not in existing_titles:
+                        finding = VulnerabilityFinding(
+                            title=title,
+                            severity=severity,
+                            vuln_type=vuln_type,
+                            description=f"通过工具验证确认：{fact}",
+                            verified=True,  # ★ Auto-verify: confirmed_facts are tool-verified
+                            verification_status="verified",
+                        )
+                        self.context.state.add_finding(finding)
+                        existing_titles.add(title)
+                    break  # One elevation per fact is enough
+
+        # ── Extract key discoveries as notes ────────────────────────────────
+        # ★ CRITICAL: notes should only record actual tool results and verified facts,
+        # NOT the LLM's reasoning inner monologue. Strip think tags BEFORE extracting
+        # discovery markers, otherwise "<think> 发现了SQL注入...</think>" → "发现了SQL注入"
+        # which looks like a confirmed finding but is just the LLM planning to test.
+        clean_response = strip_think_tags(response)
+
         discovery_markers = [
             r'\[\+\]\s*(.+?)(?:\n|$)',        # [+] findings
             r'发现[：:]\s*(.+?)(?:\n|$)',      # 发现: xxx
@@ -2305,36 +2646,50 @@ class AgentCore:
             r'(CTF\{[^}]+\})',                # CTF{...}
         ]
         for pattern in discovery_markers:
-            matches = re.findall(pattern, response, re.IGNORECASE)
-            for match in matches:
+            for match in re.findall(pattern, clean_response, re.IGNORECASE):
                 note = match.strip()[:200]
-                # Avoid duplicate notes
                 if note and note not in self.context.state.notes:
                     self.context.state.add_note(note)
 
-        # ★ Auto-extract confirmed facts (verified by tool output)
+        # ── Auto-extract confirmed facts ───────────────────────────────────
+        # ★ Expanded: the original strict patterns missed most LLM confirmations.
+        # LLM says "CAS SQL注入确认存在" or "验证成功，SLEEP(3)耗时3.2秒"
+        # — these don't match the old precise patterns.
         confirmed_markers = [
+            # Precise (existing)
             r'已确认[：:]\s*(.+?)(?:\n|$)',
             r'确认[：:]\s*(.+?)(?:\n|$)',
             r'验证成功[：:]\s*(.+?)(?:\n|$)',
             r'\[✅\]\s*(.+?)(?:\n|$)',
+            # ★ Expanded — broad confirmation language
+            r'确认.*存在',                         # "SQL注入确认存在"
+            r'漏洞.*已确认',                       # "漏洞已确认"
+            r'已.*验证.*成功',                     # "已验证成功"
+            r'payload.*差异[：:]*\s*\d+',         # "payload差异: 155" or "差异 155"
+            r'差异[：:]*\s*\d+.*成功',            # "差异306 - 成功"
+            r'SLEEP\([^)]+\).*耗时',             # "SLEEP(3)耗时3.2秒"
+            r'成功提取[：:]*\s*\S+',             # "成功提取到关键信息"
+            r'提取到[：:]*\s*\S+',               # "提取到 root用户"
+            r'命令执行成功',                       # "命令执行成功"
+            r'可提取[：:]*\s*\S+',               # "可提取数据"
+            r'布尔.*成功|布尔.*有效',             # "布尔注入成功"
+            r'报错.*成功|报错.*有效',             # "报错注入成功"
+            r'UNION.*成功|UNION.*有效',           # "UNION SELECT 成功"
+            r'漏洞确认',                           # "SQL注入漏洞确认"
         ]
         for pattern in confirmed_markers:
-            matches = re.findall(pattern, response, re.IGNORECASE)
-            for match in matches:
+            for match in re.findall(pattern, response, re.IGNORECASE):
                 fact = match.strip()[:200]
-                # ★ 去重检查：避免重复添加相同的 confirmed fact
                 if fact and hasattr(self.context.state, 'add_confirmed_fact'):
                     self.context.state.add_confirmed_fact(fact)
 
-        # ★ Auto-extract unverified assumptions from LLM output
+        # ── Auto-extract unverified assumptions ────────────────────────────
         assumption_markers = [
             r'假设[：:]\s*(.+?)(?:\n|$)',
             r'推测[：:]\s*(.+?)(?:\n|$)',
         ]
         for pattern in assumption_markers:
-            matches = re.findall(pattern, response, re.IGNORECASE)
-            for match in matches:
+            for match in re.findall(pattern, response, re.IGNORECASE):
                 assumption = match.strip()[:200]
                 if assumption and hasattr(self.context.state, 'add_assumption'):
                     self.context.state.add_assumption(assumption)

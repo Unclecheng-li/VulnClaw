@@ -8,7 +8,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI_Compatible-green)](https://platform.openai.com/)
 [![MCP](https://img.shields.io/badge/Toolchain-MCP-orange)](https://modelcontextprotocol.io/)
-[![PyPI](https://img.shields.io/badge/PyPI-v0.1.9-blueviolet)](https://pypi.org/project/vulnclaw/)
+[![PyPI](https://img.shields.io/badge/PyPI-v0.2.0-blueviolet)](https://pypi.org/project/vulnclaw/)
 [![Security](https://img.shields.io/badge/Scope-Authorized_Only-red)](#-security-notice)
 <br>
 
@@ -122,6 +122,66 @@ MCP Services:
   ...
 
 ✅ Ready. Run vulnclaw to start.
+```
+
+---
+
+## CLI Command Reference
+
+Run `vulnclaw --help` to see all available commands:
+
+```bash
+$ vulnclaw --help
+
+🦞 VulnClaw — AI-powered penetration testing CLI
+
+ Usage: vulnclaw [OPTIONS] COMMAND [ARGS]...
+
+ Options:
+   --version  Show version and exit.
+   --help     Show this message and exit.
+
+ Commands:
+   run           🚀 Full pentest in one shot
+   persistent    🔄 Persistent pentesting (100 rounds/cycle)
+   recon         🔍 Reconnaissance only (no exploitation)
+   scan          🔎 Vulnerability scanning
+   exploit       💥 Exploitation phase
+   report        📝 Generate report from session JSON
+   config        ⚙️  Manage config (set/get/list/provider)
+   init          🔧 Initialize configuration
+   doctor        🏥  Check runtime environment
+```
+
+### Command Reference
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `vulnclaw` | Launch REPL interactive shell (default, no args) | `vulnclaw` |
+| `vulnclaw run <target>` | Full pentest in one shot | `vulnclaw run 192.168.1.1` |
+| `vulnclaw persistent <target>` | Persistent pentesting | `vulnclaw persistent 192.168.1.1` |
+| `vulnclaw recon <target>` | Reconnaissance only | `vulnclaw recon target.com` |
+| `vulnclaw scan <target>` | Vulnerability scanning | `vulnclaw scan target.com --ports 80,443` |
+| `vulnclaw exploit <target>` | Exploitation phase | `vulnclaw exploit target.com --cve CVE-2024-1234` |
+| `vulnclaw report <session>` | Generate report from session | `vulnclaw report session_xxx.json` |
+| `vulnclaw config set <key> <value>` | Set a config value | `vulnclaw config set llm.api_key sk-xxx` |
+| `vulnclaw config get <key>` | View a config value | `vulnclaw config get llm.model` |
+| `vulnclaw config list` | List all config | `vulnclaw config list` |
+| `vulnclaw config provider <name>` | Switch LLM provider | `vulnclaw config provider deepseek` |
+| `vulnclaw init` | Initialize config files | `vulnclaw init` |
+| `vulnclaw doctor` | Check runtime environment | `vulnclaw doctor` |
+
+### Provider Configuration
+
+```bash
+# List all providers and switch
+vulnclaw config provider --list    # list all available providers
+vulnclaw config provider minimax   # switch to MiniMax
+
+# Manual setup (custom mode)
+vulnclaw config set llm.base_url https://your-api.com/v1
+vulnclaw config set llm.model your-model-name
+vulnclaw config set llm.api_key sk-your-key
 ```
 
 ---

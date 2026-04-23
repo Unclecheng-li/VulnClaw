@@ -82,23 +82,24 @@ REPORT_TEMPLATE = """\
 
 {% for finding in findings %}
 ### 3.{{ loop.index }} {{ finding.title }} — [{{ finding.severity }}]
+{% if finding.verification_status == "pending" %}
+> ⚠️ **待验证** — 此漏洞由自动检测发现，尚未通过 PoC 验证。请手动审查。
+{% elif finding.verification_status == "rejected" %}
+> ❌ **已排除（误报）** — {{ finding.verification_note or "经验证为误报" }}
+{% endif %}
 
-{% if finding.verified %}
-- **漏洞类型**: {{ finding.vuln_type }}
+- **漏洞类型**: {{ finding.vuln_type or "未分类" }}
 - **CVE**: {{ finding.cve or "N/A" }}
-- **影响范围**: {{ finding.description }}
-- **验证证据**:
-{{ finding.evidence }}
+- **影响范围**: {{ finding.description or "无" }}
+{% if finding.evidence %}
+- **验证证据**: {{ finding.evidence }}
+{% endif %}
 {% if finding.poc_script %}
 - **PoC 脚本**: 见附件 `{{ finding.poc_script }}`
 {% endif %}
 - **修复建议**: {{ finding.remediation or "请根据漏洞类型采取相应修复措施" }}
-
-{% if finding.verified_at %}
+{% if finding.verified and finding.verified_at %}
 - **验证时间**: {{ finding.verified_at }}
-{% endif %}
-{% else %}
-- ⚠️ 此漏洞尚未验证，未包含在报告中
 {% endif %}
 
 {% endfor %}
@@ -180,12 +181,13 @@ def generate_report(
     """
     from vulnclaw import __version__
 
-    # ★ 只包含已验证的漏洞
+    # ★ 包含所有 findings（包括 pending 和 confirmed，不只是 verified）
+    all_findings = session.findings
     verified_findings = session.get_verified_findings()
     pending_findings = session.get_pending_findings()
     rejected_findings = session.get_rejected_findings()
 
-    # Count verified findings by severity
+    # Count verified findings by severity (only verified count toward real results)
     severity_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
     for finding in verified_findings:
         sev = finding.severity
@@ -194,11 +196,17 @@ def generate_report(
         else:
             severity_counts["Medium"] += 1
 
-    # Generate key recommendations from verified findings
+    # Generate recommendations from verified high/critical findings only
+    # Deduplicate by vuln_type: only one recommendation per vulnerability type
+    seen_vuln_types = set()
     recommendations = []
     for finding in verified_findings:
         if finding.severity in ("Critical", "High"):
-            rec = finding.remediation or f"修复 {finding.vuln_type} 漏洞: {finding.title}"
+            vt = finding.vuln_type or "未分类"
+            if vt in seen_vuln_types:
+                continue  # Already have a rec for this vuln_type
+            seen_vuln_types.add(vt)
+            rec = finding.remediation or f"修复 {vt} 漏洞: {finding.title}"
             recommendations.append(rec)
 
     if not recommendations:
@@ -216,17 +224,17 @@ def generate_report(
         "low_count": severity_counts["Low"] + severity_counts["Info"],
         "attack_surface_summary": _summarize_attack_surface(session),
         "key_recommendations": recommendations,
-        "findings": verified_findings,  # ★ 只用已验证的漏洞
+        "findings": verified_findings,  # ★ 只包含已验证漏洞，pending/rejected 不写入详细发现章节
         "executed_steps": session.executed_steps,
         # ★ 额外统计信息
-        "total_findings_submitted": len(session.findings),
+        "total_findings_submitted": len(all_findings),
         "verified_count": len(verified_findings),
         "rejected_count": len(rejected_findings),
         "pending_count": len(pending_findings),
-        "rejected_findings": rejected_findings,  # 可选：列出排除的误报
+        "rejected_findings": rejected_findings,
         # ★ 攻击路径摘要
         "step_summary": session.get_step_summary(),
-        "llm_attack_summary": llm_attack_summary,  # ★ LLM 生成的攻击路径摘要
+        "llm_attack_summary": llm_attack_summary,
     }
 
     # Render report
@@ -259,10 +267,12 @@ def generate_report_from_file(session_path: str) -> Path:
 
 
 def _summarize_attack_surface(session: SessionState) -> str:
-    """Summarize the attack surface from recon data."""
+    """Summarize the attack surface from recon data, including subdomains."""
     parts = []
     recon = session.recon_data
 
+    if "subdomains" in recon and recon["subdomains"]:
+        parts.append(f"子域名: {', '.join(recon['subdomains'][:10])}")
     if "ports" in recon:
         parts.append(f"开放端口: {recon['ports']}")
     if "services" in recon:
@@ -271,6 +281,8 @@ def _summarize_attack_surface(session: SessionState) -> str:
         parts.append(f"技术栈: {recon['technologies']}")
     if "waf" in recon:
         parts.append(f"WAF: {recon['waf']}")
+    if "domains" in recon:
+        parts.append(f"关联域名: {', '.join(recon['domains'][:5])}")
 
     return "; ".join(parts) if parts else "未收集"
 
@@ -293,14 +305,19 @@ CYCLE_REPORT_TEMPLATE = """\
 | **报告生成时间** | {{ generated_at }} |
 
 {% if cycle_findings %}
-## 本周期已验证漏洞发现
+## 本周期漏洞发现
 
 {% for finding in cycle_findings %}
-### {{ finding.title }} — [{{ finding.severity }}]
-
-- **漏洞类型**: {{ finding.vuln_type }}
+### {{ loop.index }}. {{ finding.title }} — [{{ finding.severity }}]
+{% if finding.verification_status == "pending" %}
+> ⚠️ **待验证** — 此漏洞由自动检测发现，尚未通过 PoC 验证。
+{% endif %}
+- **漏洞类型**: {{ finding.vuln_type or "未分类" }}
 - **CVE**: {{ finding.cve or "N/A" }}
+- **影响范围**: {{ finding.description or "无" }}
+{% if finding.evidence %}
 - **验证证据**: {{ finding.evidence }}
+{% endif %}
 - **修复建议**: {{ finding.remediation or "请根据漏洞类型采取相应修复措施" }}
 {% if finding.verified_at %}
 - **验证时间**: {{ finding.verified_at }}
@@ -310,19 +327,20 @@ CYCLE_REPORT_TEMPLATE = """\
 {% else %}
 ## 本周期漏洞发现
 
-本周期未发现新的已验证漏洞。已对已有攻击面进行深入验证。
+本周期未发现新漏洞。
 {% endif %}
 
-## 累计已验证漏洞汇总
+## 累计漏洞汇总
 
-| # | 漏洞标题 | 等级 | 类型 |
-|---|---------|------|------|
+| # | 漏洞标题 | 等级 | 类型 | 证据/URL | 状态 |
+|---|---------|------|------|---------|------|
 {% for finding in all_findings %}
-| {{ loop.index }} | {{ finding.title }} | {{ finding.severity }} | {{ finding.vuln_type }} |
+{% set ev = (finding.evidence or finding.description or "")[:80] %}
+| {{ loop.index }} | {{ finding.title }} | {{ finding.severity }} | {{ finding.vuln_type or "—" }} | {{ ev if ev else "—" }} | {% if finding.verification_status == "verified" %}✅ 已验证{% elif finding.verification_status == "pending" %}⚠️ 待验证{% else %}❌ 已排除{% endif %} |
 {% endfor %}
 
 {% if not all_findings %}
-暂未发现已验证漏洞
+暂未发现漏洞
 {% endif %}
 
 ## 风险等级分布
@@ -421,10 +439,11 @@ def generate_persistent_cycle_report(
     """
     from vulnclaw import __version__
 
-    # ★ 只使用已验证的漏洞
+    # ★ 包含所有 findings（包括 pending 和 confirmed，不只是 verified）
+    all_findings = session.findings
     verified_findings = session.get_verified_findings()
 
-    # Count verified findings by severity
+    # Count verified findings by severity only (pending doesn't count as real result)
     severity_counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Info": 0}
     for finding in verified_findings:
         sev = finding.severity
@@ -433,17 +452,21 @@ def generate_persistent_cycle_report(
         else:
             severity_counts["Medium"] += 1
 
-    # ★ 已验证的漏洞发现
-    verified_new = [f for f in verified_findings if f.verification_status == "verified"]
-    cycle_findings = verified_new[-new_findings:] if new_findings > 0 else []
+    # ★ 本周期新增已验证 findings（只统计 verified）
+    cycle_findings = verified_findings[-new_findings:] if new_findings > 0 else []
 
-    # Generate recommendations from high/critical verified findings
+    # Generate recommendations from verified high/critical findings only
+    # Deduplicate by vuln_type: only one recommendation per vulnerability type
+    seen_vuln_types = set()
     recommendations = []
     for finding in verified_findings:
         if finding.severity in ("Critical", "High"):
-            rec = finding.remediation or f"修复 {finding.vuln_type} 漏洞: {finding.title}"
-            if rec not in recommendations:
-                recommendations.append(rec)
+            vt = finding.vuln_type or "未分类"
+            if vt in seen_vuln_types:
+                continue
+            seen_vuln_types.add(vt)
+            rec = finding.remediation or f"修复 {vt} 漏洞: {finding.title}"
+            recommendations.append(rec)
     if not recommendations:
         recommendations.append("暂无高危发现，继续深入测试")
 
@@ -457,21 +480,21 @@ def generate_persistent_cycle_report(
         "target": session.target or "未指定",
         "cycle_num": cycle_num,
         "rounds_per_cycle": rounds_per_cycle,
-        "new_findings": len(cycle_findings),  # ★ 更新为已验证的数量
-        "total_findings": len(verified_findings),  # ★ 更新为已验证的总数
+        "new_findings": len(cycle_findings),
+        "total_findings": len(all_findings),
         "total_steps": total_steps,
         "generated_at": datetime.now().isoformat(),
         "version": __version__,
         "cycle_findings": cycle_findings,
-        "all_findings": verified_findings,  # ★ 只包含已验证的
+        "all_findings": all_findings,  # ★ 包含所有 findings（包括 pending）
         "critical_count": severity_counts["Critical"],
         "high_count": severity_counts["High"],
         "medium_count": severity_counts["Medium"],
         "low_count": severity_counts["Low"] + severity_counts["Info"],
         "recent_steps": recent_steps,
         "recommendations": recommendations,
-        "step_summary": step_summary,  # ★ 攻击路径摘要
-        "llm_attack_summary": llm_attack_summary,  # ★ LLM 生成的攻击路径摘要
+        "step_summary": step_summary,
+        "llm_attack_summary": llm_attack_summary,
     }
 
     # Render report

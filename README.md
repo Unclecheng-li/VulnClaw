@@ -8,7 +8,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI_Compatible-green)](https://platform.openai.com/)
 [![MCP](https://img.shields.io/badge/Toolchain-MCP-orange)](https://modelcontextprotocol.io/)
-[![PyPI](https://img.shields.io/badge/PyPI-v0.1.9-blueviolet)](https://pypi.org/project/vulnclaw/)
+[![PyPI](https://img.shields.io/badge/PyPI-v0.2.0-blueviolet)](https://pypi.org/project/vulnclaw/)
 [![Security](https://img.shields.io/badge/Scope-Authorized_Only-red)](#-安全声明)
 <br>
 
@@ -125,6 +125,66 @@ MCP 服务:
   ...
 
 ✅ 环境就绪，运行 vulnclaw 开始
+```
+
+---
+
+## CLI 命令速查
+
+`vulnclaw --help` 查看所有命令：
+
+```bash
+$ vulnclaw --help
+
+🦞 VulnClaw — AI-powered penetration testing CLI
+
+ Usage: vulnclaw [OPTIONS] COMMAND [ARGS]...
+
+ Options:
+   --version  Show version and exit.
+   --help     Show this message and exit.
+
+ Commands:
+   run           🚀 一键全流程渗透测试
+   persistent    🔄 持续性渗透测试（100轮/周期）
+   recon         🔍 仅信息收集阶段
+   scan          🔎 执行漏洞扫描阶段
+   exploit       💥 执行漏洞利用阶段
+   report        📝 从会话记录生成报告
+   config        ⚙️  管理配置（set/get/list/provider）
+   init          🔧 初始化配置
+   doctor        🏥  检查运行环境
+```
+
+### 命令详解
+
+| 命令 | 说明 | 示例 |
+|------|------|------|
+| `vulnclaw` | 启动 REPL 交互界面（无参数默认） | `vulnclaw` |
+| `vulnclaw run <target>` | 一键全流程渗透测试 | `vulnclaw run 192.168.1.1` |
+| `vulnclaw persistent <target>` | 持续性渗透（100轮/周期） | `vulnclaw persistent 192.168.1.1` |
+| `vulnclaw recon <target>` | 仅信息收集（不利用漏洞） | `vulnclaw recon target.com` |
+| `vulnclaw scan <target>` | 漏洞扫描阶段 | `vulnclaw scan target.com --ports 80,443` |
+| `vulnclaw exploit <target>` | 漏洞利用阶段 | `vulnclaw exploit target.com --cve CVE-2024-1234` |
+| `vulnclaw report <session>` | 从会话 JSON 生成报告 | `vulnclaw report session_xxx.json` |
+| `vulnclaw config set <key> <value>` | 设置配置项 | `vulnclaw config set llm.api_key sk-xxx` |
+| `vulnclaw config get <key>` | 查看配置项 | `vulnclaw config get llm.model` |
+| `vulnclaw config list` | 列出所有配置 | `vulnclaw config list` |
+| `vulnclaw config provider <name>` | 切换 LLM 提供商 | `vulnclaw config provider minimax` |
+| `vulnclaw init` | 初始化配置文件 | `vulnclaw init` |
+| `vulnclaw doctor` | 检查运行环境 | `vulnclaw doctor` |
+
+### 配置管理
+
+```bash
+# 查看所有提供商并切换
+vulnclaw config provider --list    # 查看所有可用提供商
+vulnclaw config provider minimax   # 切换到 MiniMax
+
+# 手动设置（custom 模式）
+vulnclaw config set llm.base_url https://your-api.com/v1
+vulnclaw config set llm.model your-model-name
+vulnclaw config set llm.api_key sk-your-key
 ```
 
 ---
