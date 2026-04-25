@@ -8,161 +8,160 @@ import re
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+
 
 from vulnclaw.config.schema import VulnClawConfig
 from vulnclaw.agent.context import ContextManager, PentestPhase, SessionState
 from vulnclaw.agent.prompts import build_system_prompt, AUTO_PENTEST_INSTRUCTION, RECON_INSTRUCTION
-
-# ── Recon minimum rounds & dimension tracking ──────────────────────
-
-RECON_MIN_ROUNDS = 8  # 信息收集阶段最低轮数，低于此数 [DONE] 被忽略
-
-# Keywords that indicate each recon dimension has been explored
-# ★ Include BOTH tool-result signatures AND natural-language descriptions from notes/confirmed_facts
-_RECON_DIM_KEYWORDS: dict[str, list[str]] = {
-    "server": [
-        # Tool-result signatures (exact)
-        "端口", "port", "nmap", "开放", "open", "服务版本", "service",
-        "真实ip", "real ip", "cdn", "源站", "操作系统", "os检测", "ttl",
-        "中间件", "middleware", "数据库", "database", "mysql", "redis",
-        # Natural-language descriptions (broader)
-        "扫描", "端口扫描", "ip地址", "ip探测", "存活主机",
-        "apache", "nginx", "tomcat", "iis", "jetty",
-        "操作系统", "linux", "windows", "ubuntu", "centos",
-    ],
-    "website": [
-        # Tool-result signatures
-        "waf", "web应用防火墙", "敏感目录", "目录扫描", "dirsearch", "gobuster",
-        "源码泄露", ".git", ".svn", ".ds_store", ".env", "备份文件", ".bak",
-        "旁站", "同ip", "c段", "同网段", "指纹", "cms", "框架", "framework",
-        "架构", "技术栈", "web指纹",
-        # Natural-language descriptions (broader)
-        "网站", "web", "javascript", "js文件", "api端点", "api端",
-        "cms", "wordpress", "dedecms", "phpcms", "discuz",
-        "登录", "后台", "管理", "admin", "login",
-        "页面", "url", "目录", "文件",
-    ],
-    "domain": [
-        # Tool-result signatures
-        "whois", "注册人", "注册商", "icp", "备案", "子域名", "subdomain",
-        "dns记录", "cname", "mx记录", "txt记录", "证书透明", "crt.sh",
-        "证书信息", "ssl证书",
-        # Natural-language descriptions (broader)
-        "域名", "dns", " registr", "注册信息", "icp备案",
-        "子域名", "子站", "crt.sh", "证书",
-    ],
-    # ⚠️ personnel: 只检测真正的社工行动结果，不靠代码片段中的通用词
-    "personnel": [
-        # 真正的 GitHub API 返回结果特征
-        "github_id", "followers", "following", "public_repos",
-        "unclecheng",  # 从 GitHub API 返回中提取的真实姓名
-        # 真正的社工发现结果（不是代码中的字符串）
-        "twitter",  # 但必须是 URL 路径中的，不是 import 语句
-        # ★ 扩展：社工相关的自然语言描述
-        "社工", "社会工程", "人员信息", "作者追踪", "人物画像",
-    ],
-}
+from vulnclaw.agent.runtime_state import AgentResult, PersistentCycleResult, RuntimeState
+from vulnclaw.agent.think_filter import strip_think_tags, format_think_tags
+from vulnclaw.agent.finding_parser import FindingParser
+from vulnclaw.agent.llm_client import call_llm, call_llm_auto, extract_response
+from vulnclaw.agent.loop_controller import auto_pentest as run_auto_pentest, persistent_pentest as run_persistent_pentest
+from vulnclaw.agent.recon_tracker import RECON_MIN_ROUNDS, update_recon_dimension_completion
+from vulnclaw.agent.tool_call_manager import (
 
 
-# ── Think tag filtering ────────────────────────────────────────
+    handle_tool_calls,
+    handle_tool_calls_with_results,
+    safe_parse_tool_args,
+)
+from vulnclaw.agent.builtin_tools import (
 
-# Closed think blocks: <think>...</think> or <thinking>...</thinking>
-_THINK_CLOSED = re.compile(
-    r"<(?:think|thinking|<think>|result_info|reasoning)>?.*?</(?:think|thinking|<think>|result_info|reasoning)>?",
-    re.DOTALL | re.IGNORECASE,
+
+    BLOCKED_PATTERNS,
+    RESERVED_IP_RANGES,
+    build_openai_tools,
+    execute_mcp_tool,
+    execute_python,
+    execute_nmap,
+    is_reserved_ip,
+    parse_nmap_xml,
+    validate_scan_target,
 )
 
-# Unclosed think blocks: <thinking>... or <think>... (no closing tag, extends to end of text)
-# This is common with DeepSeek R1 and other reasoning models that output
-# <thinking> without a matching </thinking>
-# Note: re.MULTILINE is intentionally omitted — this pattern has no ^/$ anchors,
-# and MULTILINE would make $ match before any newline; combined with the greedy
-# .* (which already matches newlines via DOTALL), $ could cause premature
-# termination when content contains newlines before the true end of string.
-_THINK_UNCLOSED = re.compile(
-    r"<(?:think|thinking|<think>|reasoning)>?.*",
-    re.DOTALL | re.IGNORECASE,
-)
-
-# Opening/closing tag patterns for extracting inner content
-_OPEN_TAG = re.compile(r"^<(?:think|thinking|reasoning)>?", re.IGNORECASE)
-_CLOSE_TAG = re.compile(r"</?(?:think|thinking|reasoning)>?$", re.IGNORECASE)
+# Optional KB integration — gracefully degrade if KB data is unavailable
+try:
+    from vulnclaw.kb.retriever import KnowledgeRetriever
+except Exception:
+    KnowledgeRetriever = None
 
 
-def strip_think_tags(text: str) -> str:
-    """Remove all <think>/<thinking> blocks from text.
-    
-    Handles both closed and unclosed think tags.
-    Many reasoning models (DeepSeek R1, etc.) output <thinking> without
-    a closing </thinking> tag, causing the rest of the content to be
-    swallowed as part of the thinking block.
-    """
-    # First pass: remove closed blocks
-    text = _THINK_CLOSED.sub("", text)
-    # Second pass: remove unclosed blocks (tag with no closing, eats rest of text)
-    text = _THINK_UNCLOSED.sub("", text)
-    return text.strip()
 
 
-def format_think_tags(text: str, show: bool) -> str:
-    """Format output based on show_thinking setting.
-
-    If show=True:  keep think tags and content as-is (untouched).
-    If show=False: strip think tags and their content entirely.
-    
-    Handles both closed and unclosed think tags.
-    """
-    if show:
-        # Return the text as-is — thinking tags and content are preserved
-        return text
-    return strip_think_tags(text)
-
-@dataclass
-class AgentResult:
-    """Result from a single agent turn."""
-
-    output: str = ""
-    target: Optional[str] = None
-    phase: Optional[str] = None
-    tool_calls: list[dict] = field(default_factory=list)
-    findings: list[dict] = field(default_factory=list)
-    should_continue: bool = True  # Whether the agent should keep looping
-
-
-@dataclass
-class PersistentCycleResult:
-    """Result from a single persistent pentest cycle."""
-
-    cycle_num: int = 0
-    results: list = field(default_factory=list)  # list[AgentResult]
-    report_path: Optional[str] = None
-    total_findings: int = 0
-    total_steps: int = 0
-    new_findings: int = 0
-    stopped_early: bool = False  # User interrupted or hard limit reached
 
 
 class AgentCore:
+
+
+
+
     """Core AI agent that orchestrates LLM calls and tool execution."""
+
+    _RUNTIME_FIELDS = (
+        "auto_skill_input",
+        "user_vuln_hint",
+        "user_vuln_hint_rounds",
+        "claimed_flag",
+        "flag_verified",
+        "flag_claim_count",
+        "post_flag_rounds",
+        "is_recon_phase",
+        "rounds_without_progress",
+        "last_findings_count",
+        "last_notes_count",
+        "last_steps_count",
+        "python_timeout_rounds",
+        "seen_step_signatures",
+        "current_attack_path",
+        "same_path_fail_count",
+        "path_switch_forced",
+        "failed_targets",
+        "blocked_targets",
+        "unverified_assumptions",
+        "is_ctf_mode",
+        "consecutive_errors",
+    )
 
     def __init__(self, config: VulnClawConfig, mcp_manager: Any = None) -> None:
         self.config = config
         self.mcp_manager = mcp_manager
         self.context = ContextManager()
         self._client = None
+        self.runtime = RuntimeState()
+        self._reset_runtime_state()
+        # Optional KB retriever — lazily initialized on first use
+        self._kb_retriever: Any = None
+        self._finding_parser = FindingParser(self.context, self.runtime)
+
+
+    def __getattr__(self, name: str) -> Any:
+        """Backward-compatible bridge for legacy _runtime field access."""
+        if name.startswith("_"):
+            runtime_name = name[1:]
+            if runtime_name in self._RUNTIME_FIELDS:
+                return getattr(self.runtime, runtime_name)
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Backward-compatible bridge for legacy _runtime field assignment."""
+        if name.startswith("_"):
+            runtime_fields = type(self).__dict__.get("_RUNTIME_FIELDS", ())
+            runtime = self.__dict__.get("runtime")
+            runtime_name = name[1:]
+            if runtime is not None and runtime_name in runtime_fields:
+                setattr(runtime, runtime_name, value)
+                return
+        super().__setattr__(name, value)
 
     @property
     def session_state(self) -> SessionState:
+
         """Access current session state."""
         return self.context.state
 
     def reset_context(self) -> None:
-        """Reset agent context."""
+        """Reset agent context and runtime loop state."""
         self.context.reset()
+        self._reset_runtime_state()
+
+    def _reset_runtime_state(
+        self,
+        user_input: str = "",
+        detected_phase: Optional[PentestPhase] = None,
+    ) -> None:
+        """Reset per-run runtime state to avoid cross-run contamination."""
+        user_lower = user_input.lower() if user_input else ""
+        self.runtime = RuntimeState(
+            auto_skill_input=user_input,
+            user_vuln_hint=self._extract_user_vuln_hint(user_input) if user_input else "",
+            is_recon_phase=detected_phase == PentestPhase.RECON,
+            is_ctf_mode=any(
+                kw in user_lower for kw in ["ctf", "flag", "夺旗", "解题", "找flag", "找出flag"]
+            ),
+        )
+        self.runtime.user_vuln_hint_rounds = 3 if self.runtime.user_vuln_hint else 0
+
+        self.context.state.recon_dimensions_completed = {
+            "server": False,
+            "website": False,
+            "domain": False,
+            "personnel": False,
+        }
+        social_engineering_keywords = [
+            "社会工程", "社工", "人员信息", "作者追踪", "人物追踪", "人物画像",
+            "osint", "情报", "作者", "调查",
+        ]
+        self.context.state.recon_dimension4_active = (
+            self.runtime.is_recon_phase
+            and any(kw in user_lower for kw in social_engineering_keywords)
+        )
+        # Re-bind finding parser to the new runtime object
+        self._finding_parser = FindingParser(self.context, self.runtime)
 
     def _get_client(self):
+
         """Lazy-initialize OpenAI client."""
         if self._client is None:
             try:
@@ -248,7 +247,13 @@ class AgentCore:
                     )
                     prompt += "\n\n" + recon_no_personnel
 
+        # ★ Inject knowledge-base context when available
+        kb_context = self._build_kb_context(user_input)
+        if kb_context:
+            prompt += "\n\n" + kb_context
+
         return prompt
+
 
     def _get_active_skill_context(self, user_input: Optional[str] = None) -> Optional[str]:
         """Get context from the most relevant Skill based on user input.
@@ -285,7 +290,70 @@ class AgentCore:
             pass
         return None
 
+    def _build_kb_context(self, user_input: Optional[str] = None) -> str:
+        """Build knowledge-base context for prompt injection.
+
+        Retrieves relevant CVEs, techniques, and WAF bypass info based on
+        current session state and user input. Returns empty string if KB
+        is unavailable or no relevant entries are found.
+        """
+        if KnowledgeRetriever is None:
+            return ""
+
+        try:
+            if self._kb_retriever is None:
+                self._kb_retriever = KnowledgeRetriever()
+        except Exception:
+            return ""
+
+        entries: list[dict[str, Any]] = []
+
+        # 1. Search by service versions from recon data
+        recon = getattr(self.context.state, "recon_data", {})
+        services = recon.get("services", [])
+        for svc in services[:3]:
+            parts = str(svc).lower().split("/")
+            name = parts[0]
+            version = parts[1] if len(parts) > 1 else ""
+            entries.extend(self._kb_retriever.search_by_service(name, version))
+
+        # 2. Search by vulnerability types from current findings
+        for finding in self.context.state.findings[:3]:
+            vuln_type = (finding.vuln_type or "").lower()
+            if vuln_type:
+                entries.extend(self._kb_retriever.search_technique(vuln_type))
+
+        # 3. If user input mentions WAF, retrieve bypass techniques
+        if user_input and "waf" in user_input.lower():
+            entries.extend(self._kb_retriever.get_waf_bypass())
+
+        # 4. Search by keywords in user input (for technique hints)
+        if user_input:
+            for keyword in ("sqli", "xss", "rce", "lfi", "ssrf", "csrf", "deserialization"):
+                if keyword in user_input.lower():
+                    entries.extend(self._kb_retriever.search_technique(keyword))
+
+        # Deduplicate by id and format
+        seen_ids: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for e in entries:
+            eid = e.get("id", e.get("title", ""))
+            if eid and eid not in seen_ids:
+                seen_ids.add(eid)
+                deduped.append(e)
+
+        if not deduped:
+            return ""
+
+        formatted = self._kb_retriever.format_for_prompt(deduped, max_entries=5)
+        return (
+            "## 知识库参考（相关 CVE / 利用技巧 / 绕过方法）\n"
+            "以下信息来自本地安全知识库，供参考使用：\n\n"
+            f"{formatted}\n"
+        )
+
     def _detect_phase(self, user_input: str) -> Optional[PentestPhase]:
+
         """Detect pentest phase from user input using keyword matching."""
         input_lower = user_input.lower()
 
@@ -458,7 +526,7 @@ class AgentCore:
             self.context.add_assistant_message(response_text)
 
             # Parse any structured findings from the response
-            self._parse_findings(response_text)
+            self._finding_parser.parse(response_text)
 
             # Auto-save session
             self.context.state.save()
@@ -477,344 +545,9 @@ class AgentCore:
         max_rounds: int = 15,
         on_step: Optional[Callable[[int, AgentResult], None]] = None,
     ) -> list[AgentResult]:
-        """Autonomous penetration test loop.
+        """Autonomous penetration test loop."""
+        return await run_auto_pentest(self, user_input, target, max_rounds, on_step)
 
-        Given a target and intent, the agent will continuously:
-        1. Analyze current state
-        2. Decide next action (use tool / advance phase / report)
-        3. Execute the action
-        4. Evaluate results
-        5. Repeat until done or max_rounds reached
-
-        This mirrors the KFC AI / Codex agentic loop pattern.
-
-        Args:
-            user_input: The user's initial request (e.g. "对 xxx 进行渗透测试")
-            target: Optional explicit target override
-            max_rounds: Maximum number of autonomous rounds (default 15)
-            on_step: Callback invoked after each round with (round_num, result)
-
-        Returns:
-            List of AgentResult from each round.
-        """
-        results: list[AgentResult] = []
-
-        # ── Round 0: Initial setup ──────────────────────────────────
-        detected_target = target or self._detect_target(user_input)
-        detected_phase = self._detect_phase(user_input) or PentestPhase.RECON
-
-        if detected_target:
-            self.context.state.target = detected_target
-        if detected_phase:
-            self.context.state.advance_phase(detected_phase)
-
-        # Add user's initial request to context
-        self.context.add_user_message(user_input)
-
-        # ── Skill dispatch: determine the best Skill for this task ──
-        # We dispatch once based on the initial input and reuse it for all rounds
-        self._auto_skill_input = user_input
-
-        # ★ User vulnerability hint detection: extract explicit vuln hints from user input
-        # When the user says "这个点有SQL注入" or "测试一下XX漏洞"，prioritize it
-        self._user_vuln_hint = self._extract_user_vuln_hint(user_input)
-
-        # Add user hint to system prompt in early rounds so LLM doesn't miss it
-        if self._user_vuln_hint:
-            self._user_vuln_hint_rounds = 3  # inject for first 3 rounds
-
-        # Reset flag verification state for this run
-        self._claimed_flag = None
-        self._flag_verified = False
-        self._flag_claim_count = 0  # Track how many times the same flag is claimed
-        self._post_flag_rounds = 0  # Track rounds after flag is verified (safety exit)
-
-        # ★ Recon dimension completion tracking
-        self._is_recon_phase = detected_phase == PentestPhase.RECON
-        if self._is_recon_phase:
-            self.context.state.recon_dimensions_completed = {
-                "server": False, "website": False, "domain": False, "personnel": False,
-            }
-            # Detect if dimension 4 (personnel) should be activated
-            social_engineering_keywords = [
-                "社会工程", "社工", "人员信息", "作者追踪", "人物追踪", "人物画像",
-                "osint", "情报", "作者", "调查",
-            ]
-            self.context.state.recon_dimension4_active = any(
-                kw in user_input.lower() for kw in social_engineering_keywords
-            )
-
-        # ★ Dead-loop detection: track rounds without progress
-        self._rounds_without_progress = 0
-        self._last_findings_count = 0
-        self._last_notes_count = 0
-        self._last_steps_count = 0
-        self._python_timeout_rounds = 0  # track consecutive rounds with Python timeout
-
-        # ★ Semantic step deduplication: extract operation signature (action+target)
-        # to detect loops even when LLM uses slightly different wording
-        self._seen_step_signatures: set[str] = set()
-
-        # ★ Attack path tracking: detect when the agent is stuck on one path
-        self._current_attack_path = None  # e.g. "regex_bypass", "rce", "file_inclusion"
-        self._same_path_fail_count = 0
-        self._path_switch_forced = False
-
-        # ★ Target-level failure tracking: detect repeated failed target access
-        self._failed_targets: dict[str, int] = {}  # {hostname: consecutive_fail_count}
-        self._blocked_targets: set[str] = set()     # targets that should be skipped
-
-        # ★ Assumption tracking: help the LLM verify its assumptions
-        self._unverified_assumptions = []  # assumptions noted by the agent
-
-        # ★ Detect CTF mode — when user explicitly asks for flag/CTF,
-        # we enforce strict termination: must have verified flag to stop
-        ctf_keywords = ["ctf", "flag", "夺旗", "解题", "找flag", "找出flag"]
-        self._is_ctf_mode = any(kw in user_input.lower() for kw in ctf_keywords)
-
-        # ── Autonomous loop ─────────────────────────────────────────
-        for round_num in range(1, max_rounds + 1):
-            result = AgentResult()
-            result.target = self.context.state.target
-            result.phase = self.context.state.phase.value
-
-            # Build system prompt with auto-mode instruction
-            # Reuse the Skill dispatched from the initial input
-            system_prompt = self._build_system_prompt(
-                self.context.state.target,
-                auto_mode=True,
-                user_input=getattr(self, '_auto_skill_input', user_input),
-            )
-
-            # Add a round marker to the conversation so the LLM knows it's in a loop
-            round_context = self._build_round_context(round_num, max_rounds)
-
-            try:
-                # Call LLM with full conversation + round context
-                # Note: _call_llm_auto persists tool call results to context internally
-                # so we don't add the response again for the tool call path
-                response_text = await self._call_llm_auto(system_prompt, round_context)
-                result.output = response_text
-
-                # Add the LLM's final text response to context
-                # (tool call summaries are already added inside _call_llm_auto)
-                self.context.add_assistant_message(f"[Round {round_num} 分析] {response_text}")
-
-                # Parse findings
-                self._parse_findings(response_text)
-
-                # ★ Auto-detect recon dimension completion from LLM output
-                if getattr(self, '_is_recon_phase', False):
-                    self._update_recon_dimension_completion(response_text)
-
-                # ★ Check if the LLM performed a verification step
-                # If notes contain "验证成功" or similar, mark flag as verified
-                if hasattr(self, '_claimed_flag') and self._claimed_flag and not getattr(self, '_flag_verified', False):
-                    verification_markers = [
-                        # 显式验证表达
-                        "验证成功", "验证通过", "已验证", "复现成功", "确认flag",
-                        "verified", "confirmed", "flag正确", "提交成功",
-                        # LLM 实际常用的表达方式
-                        "flag 获取成功", "flag获取成功", "获取成功", "找到flag",
-                        "flag found", "成功获取", "获取了flag", "拿到了flag",
-                        "成功拿到", "成功找到", "解题完成", "解题成功",
-                    ]
-                    if any(m in response_text.lower() for m in verification_markers):
-                        self._flag_verified = True
-
-                # ★ CTF mode: also auto-verify if the claimed flag appears in tool results
-                # This handles cases where the LLM extracts the flag from a tool response
-                # but doesn't explicitly say "验证成功"
-                if getattr(self, '_is_ctf_mode', False) and self._claimed_flag and not getattr(self, '_flag_verified', False):
-                    # Method 1: Check if the flag appears in notes (from real tool output)
-                    flag_in_notes_count = sum(
-                        1 for note in self.context.state.notes
-                        if self._claimed_flag in note
-                    )
-                    # If flag appears in notes ≥ 2 times from different tool calls,
-                    # it's been independently confirmed
-                    if flag_in_notes_count >= 2:
-                        self._flag_verified = True
-                    elif flag_in_notes_count >= 1:
-                        # Flag appears once in notes — check if LLM also claimed it
-                        # (which means both tool output and LLM analysis agree)
-                        if self._claimed_flag in response_text:
-                            self._flag_verified = True
-
-                # Detect phase transitions from LLM output
-                new_phase = self._detect_phase_from_output(response_text)
-                if new_phase and new_phase != self.context.state.phase:
-                    self.context.state.advance_phase(new_phase)
-                    result.phase = new_phase.value
-
-                # Check if agent signals completion
-                result.should_continue = not self._is_completion_signal(response_text)
-
-                # ★ Flag verification tracking — detect flag claims in LLM output
-                claimed_flag = self._detect_flag_claim(response_text)
-                if claimed_flag:
-                    if not hasattr(self, '_claimed_flag') or not self._claimed_flag:
-                        # First time flag is claimed — record it, force one verification round
-                        self._claimed_flag = claimed_flag
-                        self._flag_verified = False
-                        result.should_continue = True
-                    elif self._claimed_flag == claimed_flag and not getattr(self, '_flag_verified', False):
-                        # Same flag claimed again but not yet verified — keep going
-                        # BUT: add a safety cap — if this is the 3rd+ time the same
-                        # unverified flag appears, auto-verify to avoid infinite loop
-                        if not hasattr(self, '_flag_claim_count'):
-                            self._flag_claim_count = 0
-                        self._flag_claim_count += 1
-                        if self._flag_claim_count >= 3:
-                            # Same flag claimed 3+ times — likely genuine, auto-verify
-                            self._flag_verified = True
-                        else:
-                            result.should_continue = True
-
-                # ★ CTF mode: block [DONE] if no verified flag
-                # In CTF, the only valid completion is getting and verifying the flag.
-                # LLM might say [DONE] prematurely (e.g. "found the file with the flag"
-                # but never actually extracted the flag value).
-                if getattr(self, '_is_ctf_mode', False) and not result.should_continue:
-                    flag_verified = getattr(self, '_flag_verified', False)
-                    claimed_flag = getattr(self, '_claimed_flag', None)
-                    if not flag_verified or not claimed_flag:
-                        # Block termination — force continue
-                        result.should_continue = True
-
-                # ★ Recon phase: block [DONE] if minimum rounds not met or dimensions incomplete
-                # Prevents the LLM from prematurely concluding info gathering
-                if getattr(self, '_is_recon_phase', False) and not result.should_continue:
-                    # Check 1: Minimum rounds not yet reached
-                    if round_num < RECON_MIN_ROUNDS:
-                        result.should_continue = True
-                    # Check 2: Not all active dimensions have been explored
-                    elif not self.context.state.is_recon_complete():
-                        result.should_continue = True
-                    # ★ IMPORTANT: if flag IS verified and LLM says [DONE], LET IT STOP
-                    # This is the key fix — previously _flag_verified never became True,
-                    # so the agent kept looping even after successful flag verification
-
-                # ★ Post-flag safety exit: if flag is verified, allow [DONE] to stop the loop
-                # Also: if the LLM keeps repeating the same verified flag + [DONE],
-                # force-stop after 2 rounds to avoid the "celebration loop" problem
-                if getattr(self, '_flag_verified', False) and getattr(self, '_claimed_flag', None):
-                    if not hasattr(self, '_post_flag_rounds'):
-                        self._post_flag_rounds = 0
-                    self._post_flag_rounds += 1
-                    # After flag is verified, allow at most 2 more rounds for summary,
-                    # then force-stop regardless
-                    if self._post_flag_rounds >= 2:
-                        result.should_continue = False
-
-                # Record step with semantic deduplication
-                # Extract operation signature to detect loops even with different wording
-                # e.g. "领导信箱JavaScript完整参数" vs "领导信箱JavaScript完整参数提取"
-                # both share the same core signature → skip the duplicate
-                step_raw = f"Round {round_num}: {response_text[:100]}..."
-                # Normalize: strip the "Round N:" prefix and truncate, then collapse whitespace
-                sig = re.sub(r'Round\s*\d+:', '', step_raw).strip()[:60].lower()
-                sig = re.sub(r'\s+', '_', sig)
-                sig = re.sub(r'[^\w]', '', sig)  # remove punctuation
-
-                if sig not in self._seen_step_signatures:
-                    self._seen_step_signatures.add(sig)
-                    self.context.state.add_step(step_raw)
-                # else: skip semantically duplicate step (LLM is spinning on same task)
-
-                # ★ Target-level failure tracking: detect repeatedly failed targets
-                blocked_target = self._track_failed_target(response_text)
-
-                # ★ Dead-loop detection: check if we're making progress
-                current_findings = len(self.context.state.findings)
-                current_notes = len(self.context.state.notes)
-                current_steps = len(self.context.state.executed_steps)
-
-                # ★ Spin-loop detection: if LLM keeps repeating the same type of action
-                # (detected by semantic dedup catching the step, OR notes all sharing
-                # the same core keyword like "领导信箱"), count it as NO real progress
-                is_spinning = False
-                recent_notes = self.context.state.notes[-5:]
-                if recent_notes:
-                    # If the last 3+ notes all contain the same keyword, LLM is spinning
-                    from collections import Counter
-                    all_words = []
-                    for note in recent_notes:
-                        all_words.extend(re.findall(r'[\u4e00-\u9fff]+', note))
-                    if all_words:
-                        word_counts = Counter(all_words)
-                        if word_counts.most_common(1)[0][1] >= 3:
-                            is_spinning = True
-
-                # ★ Only meaningful steps count as progress (not failed retries)
-                last_step = self.context.state.executed_steps[-1] if self.context.state.executed_steps else ""
-                is_meaningful = self._is_meaningful_step(last_step)
-
-                has_new_progress = (
-                    current_findings > self._last_findings_count
-                    or (current_notes > self._last_notes_count and not is_spinning)
-                    or (current_steps > self._last_steps_count + 1 and is_meaningful)
-                )
-
-                if has_new_progress:
-                    self._rounds_without_progress = 0
-                    self._python_timeout_rounds = 0  # reset on progress
-                else:
-                    self._rounds_without_progress += 1
-                
-                self._last_findings_count = current_findings
-                self._last_notes_count = current_notes
-                self._last_steps_count = current_steps
-
-                # ★ Attack path tracking: detect if we're stuck on the same approach
-                # by checking the LLM output for repeated keywords/techniques
-                if not has_new_progress and not getattr(self, '_path_switch_forced', False):
-                    # Extract the attack technique from this round's output
-                    detected_path = self._detect_attack_path(response_text)
-                    if detected_path:
-                        if detected_path == getattr(self, '_current_attack_path', None):
-                            self._same_path_fail_count += 1
-                        else:
-                            # New path — reset counter
-                            self._current_attack_path = detected_path
-                            self._same_path_fail_count = 0
-                            self._path_switch_forced = False
-                elif has_new_progress:
-                    # Progress made — reset path tracking
-                    self._same_path_fail_count = 0
-                    self._path_switch_forced = False
-
-                # Auto-save
-                self.context.state.save()
-
-            except Exception as e:
-                result.output = f"[!] Round {round_num} 错误: {e}"
-                # Don't kill the loop on recoverable errors — allow up to 2 consecutive failures
-                if not hasattr(self, '_consecutive_errors'):
-                    self._consecutive_errors = 0
-                self._consecutive_errors += 1
-                if self._consecutive_errors >= 3:
-                    result.should_continue = False
-                else:
-                    result.should_continue = True
-                    # Trim conversation to avoid context overflow causing repeated failures
-                    self.context.trim_messages(max_messages=20)
-            else:
-                # Reset error counter on success
-                if hasattr(self, '_consecutive_errors'):
-                    self._consecutive_errors = 0
-
-            results.append(result)
-
-            # Notify via callback
-            if on_step:
-                on_step(round_num, result)
-
-            # Stop if agent says it's done
-            if not result.should_continue:
-                break
-
-        return results
 
     def _build_round_context(self, round_num: int, max_rounds: int) -> str:
         """Build context string for the current round in auto loop."""
@@ -828,15 +561,15 @@ class AgentCore:
         # ★ User vuln hint injection: when user explicitly hints "这个点有XX漏洞"
         # inject a direct "test it now" directive for the first few rounds
         user_hint_directive = ""
-        if (round_num <= getattr(self, '_user_vuln_hint_rounds', 0)
-                and getattr(self, '_user_vuln_hint', None)):
+        if round_num <= self._user_vuln_hint_rounds and self._user_vuln_hint:
             user_hint_directive = (
                 f"\n\n{'='*50}\n"
-                f"【用户明确提示 — 第 {round_num}/{getattr(self, '_user_vuln_hint_rounds', 0)} 轮】\n"
+                f"【用户明确提示 — 第 {round_num}/{self._user_vuln_hint_rounds} 轮】\n"
                 f"{self._user_vuln_hint}\n"
                 f"{'='*50}\n"
             )
             self._user_vuln_hint_rounds -= 1  # decrement so it expires after N rounds
+
 
         steps_summary = ""
         if state.executed_steps:
@@ -889,7 +622,8 @@ class AgentCore:
 
         # ★ Path switch warning — if stuck on same approach for too long
         path_warning = ""
-        same_path_fails = getattr(self, '_same_path_fail_count', 0)
+        same_path_fails = self._same_path_fail_count
+
         if state.executed_steps:
             recent = state.executed_steps[-8:]
             if len(recent) >= 5:
@@ -937,7 +671,8 @@ class AgentCore:
 
         # ★ Python timeout tracking — warn when previous rounds had Python timeouts
         python_timeout_warning = ""
-        python_timeout_rounds = getattr(self, '_python_timeout_rounds', 0)
+        python_timeout_rounds = self._python_timeout_rounds
+
         if python_timeout_rounds >= 1:
             python_timeout_warning = (
                 f"\n\n⚠️ **代码执行警告**：上轮 Python 脚本超时了。"
@@ -948,14 +683,14 @@ class AgentCore:
 
         # ★ Dead-loop detection — if no progress for multiple rounds
         dead_loop_warning = ""
-        rounds_no_progress = getattr(self, '_rounds_without_progress', 0)
+        rounds_no_progress = self._rounds_without_progress
         stale_threshold = self.config.session.stale_rounds_threshold
 
         # ★ Target-level failure warning: if targets are blocked
         blocked_targets_warning = ""
-        blocked_targets = getattr(self, '_blocked_targets', set())
+        blocked_targets = self._blocked_targets
         if blocked_targets:
-            targets_str = ", ".join(blocked_targets)
+
             blocked_targets_warning = (
                 f"\n\n🚨 **目标不可访问警告**：以下目标已连续多次访问失败，禁止再次尝试："
                 f"\n{chr(10).join(f'  ❌ {t} — 已确认不可达' for t in blocked_targets)}"
@@ -985,10 +720,10 @@ class AgentCore:
 
         # Flag verification warning — if a flag was claimed but not verified
         flag_warning = ""
-        claimed_flag = getattr(self, '_claimed_flag', None)
-        flag_verified = getattr(self, '_flag_verified', False)
-        post_flag_rounds = getattr(self, '_post_flag_rounds', 0)
+        claimed_flag = self._claimed_flag
+        flag_verified = self._flag_verified
         if claimed_flag and flag_verified:
+
             # Flag is verified — tell the LLM to wrap up
             flag_warning = (
                 f"\n\n✅ FLAG 已验证: {claimed_flag}"
@@ -1007,8 +742,9 @@ class AgentCore:
 
         # ★ CTF mode: enforce no early termination without flag
         ctf_mode_warning = ""
-        is_ctf = getattr(self, '_is_ctf_mode', False)
+        is_ctf = self._is_ctf_mode
         if is_ctf and not claimed_flag:
+
             ctf_mode_warning = (
                 f"\n\n🔴 CTF 解题模式 — 你的任务是找到 flag 并验证。"
                 f"\n当前你还没有找到任何 flag，禁止标记 [DONE]。"
@@ -1027,10 +763,11 @@ class AgentCore:
 
         # ★ Recon dimension completion status — prevent premature [DONE]
         recon_dim_status = ""
-        if getattr(self, '_is_recon_phase', False):
+        if self._is_recon_phase:
             dim_status_text = self.context.state.get_recon_status_text()
             is_complete = self.context.state.is_recon_complete()
-            rounds_no_progress = getattr(self, '_rounds_without_progress', 0)
+            rounds_no_progress = self._rounds_without_progress
+
             recon_dim_status = (
                 f"\n\n📊 信息收集维度完成度:"
                 f"\n{dim_status_text}"
@@ -1112,167 +849,18 @@ class AgentCore:
         on_cycle_step: Optional[Callable[[int, int, AgentResult], None]] = None,
         on_cycle_complete: Optional[Callable[[int, "PersistentCycleResult"], None]] = None,
     ) -> list["PersistentCycleResult"]:
-        """Persistent penetration test — runs cycles of auto_pentest until stopped.
+        """Persistent penetration test — runs cycles of auto_pentest until stopped."""
+        return await run_persistent_pentest(
+            self,
+            user_input,
+            target,
+            rounds_per_cycle,
+            max_cycles,
+            auto_report,
+            on_cycle_step,
+            on_cycle_complete,
+        )
 
-        Each cycle runs up to `rounds_per_cycle` rounds. After each cycle:
-        - A cycle report is auto-generated (if auto_report=True)
-        - The session state is preserved across cycles for continuity
-        - The next cycle continues from where the previous left off
-
-        The loop continues until:
-        - max_cycles is reached (default 10, set 0 for unlimited)
-        - User interrupts via Ctrl+C
-        - The agent signals completion with [DONE] and no new findings
-
-        Args:
-            user_input: The user's initial request (e.g. "对 xxx 进行持续性渗透测试")
-            target: Optional explicit target override
-            rounds_per_cycle: Number of rounds per cycle (default 100)
-            max_cycles: Maximum number of cycles (default 10, 0=unlimited)
-            auto_report: Auto-generate report after each cycle
-            on_cycle_step: Callback(round_num, cycle_num, result) for each step
-            on_cycle_complete: Callback(cycle_num, cycle_result) after each cycle
-
-        Returns:
-            List of PersistentCycleResult for each completed cycle.
-        """
-        cycle_results: list[PersistentCycleResult] = []
-
-        # ── Cycle 0: Initial setup ──────────────────────────────────
-        detected_target = target or self._detect_target(user_input)
-        if detected_target:
-            self.context.state.target = detected_target
-
-        # Add user's initial request to context
-        self.context.add_user_message(user_input)
-
-        # Store initial skill dispatch
-        self._auto_skill_input = user_input
-
-        # Reset flag verification state for this run
-        self._claimed_flag = None
-        self._flag_verified = False
-        self._flag_claim_count = 0
-        self._post_flag_rounds = 0
-
-        # ★ Dead-loop detection for persistent mode too
-        self._rounds_without_progress = 0
-        self._last_findings_count = 0
-        self._last_notes_count = 0
-        self._last_steps_count = 0
-
-        # ★ Attack path tracking for persistent mode
-        self._current_attack_path = None
-        self._same_path_fail_count = 0
-        self._path_switch_forced = False
-
-        # ★ Target-level failure tracking for persistent mode
-        self._failed_targets: dict[str, int] = {}
-        self._blocked_targets: set[str] = set()
-
-        # ★ Detect CTF mode for persistent pentest too
-        ctf_keywords = ["ctf", "flag", "夺旗", "解题", "找flag", "找出flag"]
-        self._is_ctf_mode = any(kw in user_input.lower() for kw in ctf_keywords)
-
-        # Track cumulative findings across cycles for delta detection
-        findings_at_cycle_start = len(self.context.state.findings)
-
-        # ── Persistent cycle loop ─────────────────────────────────────
-        cycle_num = 0
-        should_stop = False
-
-        while not should_stop:
-            cycle_num += 1
-
-            # Check hard limit
-            if max_cycles > 0 and cycle_num > max_cycles:
-                should_stop = True
-                break
-
-            # Run one cycle of auto_pentest
-            cycle_results_list: list[AgentResult] = []
-
-            def _make_step_callback(cycle: int):
-                """Create a step callback that captures cycle number."""
-                def _on_step(round_num: int, result: AgentResult) -> None:
-                    cycle_results_list.append(result)
-                    if on_cycle_step:
-                        on_cycle_step(round_num, cycle, result)
-                return _on_step
-
-            try:
-                results = await self.auto_pentest(
-                    user_input=(
-                        f"[Persistent Cycle {cycle_num}] 继续对目标 {self.context.state.target or '未知'} "
-                        f"进行渗透测试。这是第 {cycle_num} 个周期，保持之前的所有发现继续深入。"
-                        if cycle_num > 1 else user_input
-                    ),
-                    target=self.context.state.target,
-                    max_rounds=rounds_per_cycle,
-                    on_step=_make_step_callback(cycle_num),
-                )
-                cycle_results_list = results if results else cycle_results_list
-            except KeyboardInterrupt:
-                # User interrupted during the cycle
-                should_stop = True
-                cycle_results_list = cycle_results_list or []
-
-            # Compute cycle stats
-            total_findings = len(self.context.state.findings)
-            total_steps = len(self.context.state.executed_steps)
-            new_findings = total_findings - findings_at_cycle_start
-            findings_at_cycle_start = total_findings
-
-            # ★ Generate attack path summary with LLM before report
-            llm_summary = ""
-            try:
-                llm_summary = await self._generate_attack_summary()
-            except Exception:
-                pass  # Non-critical, fall back to template parsing
-
-            # Generate cycle report
-            report_path = None
-            if auto_report:
-                try:
-                    from vulnclaw.report.generator import generate_persistent_cycle_report
-                    report_path = generate_persistent_cycle_report(
-                        session=self.context.state,
-                        cycle_num=cycle_num,
-                        total_findings=total_findings,
-                        new_findings=new_findings,
-                        total_steps=total_steps,
-                        rounds_per_cycle=rounds_per_cycle,
-                        llm_attack_summary=llm_summary,
-                    )
-                except Exception as e:
-                    report_path = f"报告生成失败: {e}"
-
-            # Build cycle result
-            cycle_result = PersistentCycleResult(
-                cycle_num=cycle_num,
-                results=cycle_results_list,
-                report_path=str(report_path) if report_path else None,
-                total_findings=total_findings,
-                total_steps=total_steps,
-                stopped_early=should_stop,
-            )
-            cycle_results.append(cycle_result)
-
-            # Notify via callback
-            if on_cycle_complete:
-                on_cycle_complete(cycle_num, cycle_result)
-
-            # Check if the agent signaled completion in the last cycle
-            if cycle_results_list and not should_stop:
-                last_result = cycle_results_list[-1]
-                if not last_result.should_continue:
-                    # Agent said it's done — but in persistent mode, we continue
-                    # unless there are truly no new findings
-                    if new_findings == 0 and total_findings > 0:
-                        # No new findings and agent says done — meaningful completion
-                        should_stop = True
-
-        return cycle_results
 
     def _detect_phase_from_output(self, output: str) -> Optional[PentestPhase]:
         """Detect phase transition signals from LLM output."""
@@ -1430,34 +1018,8 @@ class AgentCore:
 
     @staticmethod
     def _extract_response(message) -> str:
-        """Extract the actual response text from an LLM message.
-        
-        Handles:
-        1. Normal content (no thinking)
-        2. Content with inline <thinking> tags (open/closed)
-        3. Separate reasoning_content field (DeepSeek R1, etc.)
-        
-        Returns the response text with thinking tags preserved for
-        later processing by format_think_tags/strip_think_tags.
+        return extract_response(message)
 
-        Note: <thinking> (XML-style) is the primary format. <result_info> blocks
-        are handled separately as tool call metadata and do not need here.
-        """
-        content = message.content or ""
-        
-        # Check for separate reasoning_content field (DeepSeek R1, etc.)
-        # Some providers return thinking in reasoning_content, separate from content
-        reasoning = getattr(message, "reasoning_content", None) or ""
-        if reasoning and not content:
-            # Model put all thinking in reasoning_content, content is empty
-            # Prepend thinking as a <thinking> block so format_think_tags can handle it
-            content = f"<thinking>\n{reasoning}\n</thinking>\n"
-        elif reasoning and content:
-            # Model has both reasoning and content
-            # Prepend reasoning as a <thinking> block
-            content = f"<thinking>\n{reasoning}\n</thinking>\n{content}"
-        
-        return content
 
     # ── LLM call methods ────────────────────────────────────────────
 
@@ -1515,152 +1077,13 @@ class AgentCore:
         IMPORTANT: Tool call results are persisted to self.context so that
         subsequent rounds retain memory of what was discovered.
         """
-        client = self._get_client()
+        return await call_llm_auto(self, system_prompt, round_context)
 
-        messages = [{"role": "system", "content": system_prompt}]
-
-        # Add conversation history
-        messages.extend(self.context.get_messages())
-
-        # Append round context as a user message to drive the LLM
-        messages.append({"role": "user", "content": round_context})
-
-        # Build MCP tools as function definitions if available
-        tools = self._build_openai_tools()
-
-        kwargs = {
-            "model": self.config.llm.model,
-            "messages": messages,
-            "max_tokens": self.config.llm.max_tokens,
-            "temperature": self.config.llm.temperature,
-        }
-
-        if tools:
-            kwargs["tools"] = tools
-
-        # Provider-specific parameter handling
-        provider = self.config.llm.provider.lower()
-        if provider == "openai" and "o1" in self.config.llm.model.lower():
-            kwargs["reasoning_effort"] = self.config.llm.reasoning_effort
-            kwargs.pop("temperature", None)
-
-        # Use asyncio to run sync OpenAI call with retry on overload/timeout
-        import asyncio
-        loop = asyncio.get_event_loop()
-        for attempt in range(3):
-            try:
-                response = await loop.run_in_executor(
-                    None,
-                    lambda: client.chat.completions.create(**kwargs),
-                )
-                break
-            except Exception as e:
-                err_str = str(e).lower()
-                if attempt < 2 and any(kw in err_str for kw in ["overloaded", "529", "rate limit", "timeout", "timed out", "connection"]):
-                    await asyncio.sleep((attempt + 1) * 5)
-                    continue
-                else:
-                    response = None
-                    break
-
-        if response is None or not response.choices:
-            return "[!] LLM API 异常响应（配额耗尽/限流/网络错误），请稍后重试"
-
-        choice = response.choices[0]
-
-        # Handle tool calls — execute them and feed result back
-        if choice.message.tool_calls:
-            tool_results, skipped_info = await self._handle_tool_calls_with_results(choice.message)
-
-            # Build the assistant message dict with ONLY executed tool_calls
-            # Defensively validate tool_results structure: each item must have "tool_call" key
-            executed_tcs = []
-            for tc in tool_results:
-                if not isinstance(tc, dict) or "tool_call" not in tc:
-                    # Malformed tool result — skip and log
-                    import sys
-                    print(f"[!] 跳过异常工具结果: {type(tc).__name__} {str(tc)[:100]}", file=sys.stderr)
-                    continue
-                executed_tcs.append(tc["tool_call"])
-
-            assistant_msg = {
-                "role": "assistant",
-                "content": choice.message.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        },
-                    }
-                    for tc in executed_tcs
-                ],
-            }
-            messages.append(assistant_msg)
-
-            for tool_result in tool_results:
-                if isinstance(tool_result, dict) and "tool_call_id" in tool_result:
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_result["tool_call_id"],
-                        "content": tool_result.get("content", ""),
-                    })
-
-            # ★ Persist tool call results to context so later rounds remember them
-            tool_summary_parts = []
-            for tc in executed_tcs:
-                try:
-                    args_str = str(tc.function.arguments)[:200]
-                except Exception:
-                    args_str = "<无法读取>"
-                tool_summary_parts.append(f"调用工具: {tc.function.name}({args_str})")
-            for tr in tool_results:
-                if not isinstance(tr, dict):
-                    content = str(tr)
-                else:
-                    content = tr.get("content", "")
-                # ★ Improved truncation: keep head + tail (flag usually at the end)
-                if len(content) > 1000:
-                    content = content[:500] + "\n...[中间省略]...\n" + content[-500:]
-                tool_summary_parts.append(f"工具结果: {content}")
-            # ★ Add skipped info so LLM knows what to retry next round
-            if skipped_info:
-                tool_summary_parts.append(f"⚠️ 本轮跳过: {'; '.join(skipped_info)}")
-            self.context.add_assistant_message(" | ".join(tool_summary_parts))
-
-            # Second LLM call with tool results
-            try:
-                kwargs["messages"] = messages
-                response2 = await loop.run_in_executor(
-                    None,
-                    lambda: client.chat.completions.create(**kwargs),
-                )
-                if response2 is None or not response2.choices:
-                    return f"[tool results processed] 工具已执行完毕，但二次总结请求失败（API 异常），请继续分析"
-                final_text = self._extract_response(response2.choices[0].message)
-                # Persist the follow-up LLM response too
-                self.context.add_assistant_message(final_text)
-                return final_text
-            except Exception as e2:
-                # If the follow-up call fails, return what we have
-                return f"[tool results processed] 继续分析错误: {e2}"
-
-        return self._extract_response(choice.message)
 
     async def _handle_tool_calls(self, message) -> str:
         """Handle tool calls from the LLM response (legacy single-turn)."""
-        results = []
-        for tool_call in message.tool_calls:
-            func_name = tool_call.function.name
-            func_args = self._safe_parse_tool_args(tool_call.function.arguments)
+        return await handle_tool_calls(self, message)
 
-            # Route to MCP
-            tool_result = await self._execute_mcp_tool(func_name, func_args)
-            results.append(f"[tool:{func_name}] {tool_result}")
-
-        return "\n".join(results)
 
     async def _handle_tool_calls_with_results(self, message) -> tuple[list[dict], list[str]]:
         """Handle tool calls with deduplication and rate limiting.
@@ -1668,61 +1091,8 @@ class AgentCore:
         Returns:
             (results, skipped_info) — executed results and info about skipped calls.
         """
-        MAX_CALLS_PER_ROUND = 10
+        return await handle_tool_calls_with_results(self, message)
 
-        # Step 1: Deduplicate — group by (func_name, args_normalized)
-        seen: dict[str, dict] = {}
-        for tool_call in message.tool_calls:
-            func_name = tool_call.function.name
-            func_args = self._safe_parse_tool_args(tool_call.function.arguments)
-            # Normalize args as key for deduplication
-            args_key = json.dumps(func_args, sort_keys=True, ensure_ascii=False)
-            key = f"{func_name}::{args_key}"
-            if key not in seen:
-                seen[key] = {
-                    "tool_call": tool_call,
-                    "func_name": func_name,
-                    "func_args": func_args,
-                }
-
-        deduplicated = list(seen.values())
-        total_count = len(message.tool_calls)
-        dedup_count = len(deduplicated)
-
-        # Step 2: Limit execution count
-        to_execute = deduplicated[:MAX_CALLS_PER_ROUND]
-        skipped_calls = deduplicated[MAX_CALLS_PER_ROUND:]
-        skipped_info: list[str] = []
-
-        if total_count > dedup_count:
-            skipped_info.append(f"[去重] {total_count - dedup_count} 个重复调用已合并")
-        if skipped_calls:
-            for sc in skipped_calls:
-                skipped_info.append(
-                    f"[跳过] {sc['func_name']}({str(sc['func_args'])[:100]}) "
-                    f"— 本轮已达上限，下轮继续"
-                )
-
-        # Step 3: Execute
-        results = []
-        for item in to_execute:
-            tool_call = item["tool_call"]
-            func_name = item["func_name"]
-            func_args = item["func_args"]
-            try:
-                tool_result = await self._execute_mcp_tool(func_name, func_args)
-                results.append({
-                    "tool_call": tool_call,  # Keep ToolCall object for downstream access
-                    "tool_call_id": tool_call.id,
-                    "content": f"[tool:{func_name}] {tool_result}",
-                })
-            except Exception as e:
-                import sys
-                print(f"[!] 工具执行失败 {func_name}: {e}", file=sys.stderr)
-                # Don't add malformed result — skip this tool call
-                continue
-
-        return results, skipped_info
 
     async def _generate_attack_summary(self) -> str:
         """Generate a detailed attack path summary for the cycle report.
@@ -1785,911 +1155,45 @@ class AgentCore:
     @staticmethod
     def _safe_parse_tool_args(arguments: Optional[str]) -> dict:
         """Safely parse tool call arguments JSON, with fallback for malformed input."""
-        if not arguments:
-            return {}
-        try:
-            return json.loads(arguments)
-        except json.JSONDecodeError as e:
-            # LLM sometimes generates truncated JSON — try to recover partial args
-            # Attempt 1: try adding closing braces
-            for suffix in ['"}', '"}]', '"}}', '"}}]', '"]', '}']:
-                try:
-                    return json.loads(arguments + suffix)
-                except json.JSONDecodeError:
-                    continue
-            # Attempt 2: try extracting partial key-value pairs via regex
-            partial = {}
-            kv_pattern = r'"(\w+)"\s*:\s*"([^"]*?)"'
-            for match in re.finditer(kv_pattern, arguments):
-                partial[match.group(1)] = match.group(2)
-            if partial:
-                return partial
-            # Give up — return empty dict so the loop can continue
-            return {}
+        return safe_parse_tool_args(arguments)
+
 
     async def _execute_mcp_tool(self, tool_name: str, args: dict) -> str:
         """Execute a tool call via MCP manager or built-in tools."""
-        # Built-in Python code executor
-        if tool_name == "python_execute":
-            return await self._execute_python(args)
+        return await execute_mcp_tool(self, tool_name, args)
 
-        # Built-in skill reference loader
-        if tool_name == "load_skill_reference":
-            try:
-                from vulnclaw.skills.loader import load_skill_reference
-                skill_name = args.get("skill_name", "")
-                ref_name = args.get("reference_name", "")
-                content = load_skill_reference(skill_name, ref_name)
-                if content:
-                    return content
-                return f"[!] 参考文档未找到: {skill_name}/{ref_name}"
-            except Exception as e:
-                return f"[!] 加载参考文档错误: {e}"
-
-        # Built-in nmap network scanner
-        if tool_name == "nmap_scan":
-            return await self._execute_nmap(args)
-
-        # Built-in crypto toolkit
-        if tool_name == "crypto_decode":
-            try:
-                from vulnclaw.skills.crypto_tools import execute as crypto_execute
-                operation = args.get("operation", "")
-                input_str = args.get("input", "")
-                # Build kwargs from optional params
-                kwargs = {}
-                for key in ("key", "iv", "shift", "secret", "header", "algorithm"):
-                    if key in args and args[key]:
-                        kwargs[key] = args[key]
-                        # Convert shift to int
-                        if key == "shift":
-                            kwargs[key] = int(args[key])
-                result = crypto_execute(operation=operation, input_str=input_str, **kwargs)
-                if result.get("success"):
-                    return f"[✓] {operation} 结果:\n{result['result']}"
-                return f"[!] {operation} 失败: {result.get('error', '未知错误')}"
-            except Exception as e:
-                return f"[!] 加密工具执行错误: {e}"
-
-        # Route to MCP manager
-        if not self.mcp_manager:
-            return f"[!] MCP 管理器未初始化，无法执行工具: {tool_name}"
-
-        try:
-            result = await self.mcp_manager.call_tool(tool_name, args)
-            return str(result)
-        except Exception as e:
-            return f"[!] 工具执行错误 ({tool_name}): {e}"
 
     def _build_openai_tools(self) -> list[dict]:
         """Build OpenAI function calling schema from MCP tools + built-in tools."""
-        tools = []
+        return build_openai_tools(self.mcp_manager)
 
-        # Built-in skill reference loader
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": "load_skill_reference",
-                "description": "加载指定 Skill 的参考文档，获取详细的渗透测试方法论、工作流或命令参考。当系统提示中提到'可用参考文档'时，使用此工具获取具体内容。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "skill_name": {
-                            "type": "string",
-                            "description": "Skill 名称，如 client-reverse, web-security-advanced, ai-mcp-security, intranet-pentest-advanced, pentest-tools, rapid-checklist, crypto-toolkit, ctf-web, ctf-crypto, ctf-misc, osint-recon",
-                        },
-                        "reference_name": {
-                            "type": "string",
-                            "description": "参考文档文件名，如 02-client-api-reverse-and-burp.md, web-injection.md, encoding-cheatsheet.md",
-                        },
-                    },
-                    "required": ["skill_name", "reference_name"],
-                },
-            },
-        })
-
-        # Built-in Python code executor
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": "python_execute",
-                "description": (
-                    "执行 Python 代码片段。用于：构造复杂 HTTP 请求并解析响应、"
-                    "做编码转换和数据处理、批量测试不同 payload、比较响应差异、"
-                    "执行数学计算等。代码在受限环境中执行，超时 30 秒。"
-                    "预装库：requests, beautifulsoup4, pycryptodome, base64, json, re 等。"
-                    "重要：构造 HTTP 请求时请使用此工具而非猜测响应内容。"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {
-                            "type": "string",
-                            "description": "要执行的 Python 代码。支持多行，可 import 标准库和 requests/bs4 等。",
-                        },
-                        "purpose": {
-                            "type": "string",
-                            "description": "简要说明执行目的（用于审计日志），如'构造HTTP请求测试弱比较绕过'",
-                        },
-                    },
-                    "required": ["code"],
-                },
-            },
-        })
-
-        # Built-in crypto toolkit
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": "crypto_decode",
-                "description": (
-                    "编码解码与加解密工具。遇到 base64/hex/URL/HTML/Unicode 编码字符串、"
-                    "需要计算哈希、解密 AES/DES、解析 JWT 等场景时调用此工具。"
-                    "重要：不要自行脑补解码结果，始终使用此工具确保准确性。"
-                    "支持操作：base64_encode/decode, base32_encode/decode, base58_encode/decode, "
-                    "hex_encode/decode, url_encode/decode, html_encode/decode, unicode_encode/decode, "
-                    "rot13_encode/decode, caesar_encode/decode, morse_encode/decode, "
-                    "md5_hash, sha1_hash, sha256_hash, sha512_hash, "
-                    "aes_encrypt/decrypt, jwt_decode/encode, auto_decode"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "operation": {
-                            "type": "string",
-                            "description": (
-                                "操作名称。编码: base64_encode, base32_encode, base58_encode, hex_encode, "
-                                "url_encode, html_encode, unicode_encode, rot13_encode, caesar_encode, morse_encode. "
-                                "解码: base64_decode, base32_decode, base58_decode, hex_decode, url_decode, "
-                                "html_decode, unicode_decode, rot13_decode, caesar_decode, morse_decode, auto_decode. "
-                                "哈希: md5_hash, sha1_hash, sha256_hash, sha512_hash. "
-                                "加密/解密: aes_encrypt, aes_decrypt. "
-                                "JWT: jwt_decode, jwt_encode"
-                            ),
-                        },
-                        "input": {
-                            "type": "string",
-                            "description": "待处理的输入字符串（待编码/解码/哈希/加密的文本）",
-                        },
-                        "key": {
-                            "type": "string",
-                            "description": "加密/解密密钥（AES/DES 需要，16/24/32字节）",
-                        },
-                        "iv": {
-                            "type": "string",
-                            "description": "AES 初始化向量（16字节，可选）",
-                        },
-                        "shift": {
-                            "type": "integer",
-                            "description": "Caesar 密码位移量（默认3，解码时不提供则暴力所有位移）",
-                        },
-                        "secret": {
-                            "type": "string",
-                            "description": "JWT 签名密钥",
-                        },
-                    },
-                    "required": ["operation", "input"],
-                },
-            },
-        })
-
-        # Built-in nmap network scanner
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": "nmap_scan",
-                "description": (
-                    "nmap 网络端口扫描工具。信息收集时用于发现目标开放端口、服务版本和操作系统指纹。\n"
-                    "用法示例：\n"
-                    "  扫描常见端口: scan_type=top_ports, target=1.2.3.4\n"
-                    "  SYN扫描: scan_type=syn, target=1.2.3.4（需要管理员权限）\n"
-                    "  服务版本检测: scan_type=service, target=1.2.3.4\n"
-                    "  漏洞扫描: scan_type=vuln, target=1.2.3.4\n"
-                    "  全量扫描: scan_type=full, target=1.2.3.4\n"
-                    "优先使用 nmap_scan 而非 python_execute 构造 socket 扫描，nmap 更专业更准确。"
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "target": {
-                            "type": "string",
-                            "description": "目标 IP 地址或域名（必填），如 192.168.1.1 或 scanme.nmap.org",
-                        },
-                        "scan_type": {
-                            "type": "string",
-                            "description": (
-                                "扫描类型。top_ports: 扫描常见端口(默认)；"
-                                "syn: SYN半开扫描(需root)；"
-                                "tcp: TCP连接扫描；"
-                                "service: 服务版本检测；"
-                                "os: 操作系统指纹；"
-                                "vuln: CVE漏洞扫描(NSE脚本)；"
-                                "full: 综合扫描(SYN+OS+版本+脚本)"
-                            ),
-                        },
-                        "ports": {
-                            "type": "string",
-                            "description": "指定端口或范围（可选），如 80,443,8080 或 1-1000",
-                        },
-                        "timing": {
-                            "type": "integer",
-                            "description": "扫描速度模板 0-5（默认4），数字越大越快但越容易被检测",
-                        },
-                    },
-                    "required": ["target"],
-                },
-            },
-        })
-
-        # MCP tools
-        if self.mcp_manager:
-            for schema in self.mcp_manager.get_tool_schemas():
-                tool = {
-                    "type": "function",
-                    "function": {
-                        "name": schema.get("name", ""),
-                        "description": schema.get("description", ""),
-                        "parameters": schema.get("inputSchema", {
-                            "type": "object",
-                            "properties": {},
-                        }),
-                    },
-                }
-                tools.append(tool)
-
-        return tools
 
     # ── Python code executor ─────────────────────────────────────────
 
-    # Blocked patterns for sandbox safety
-    _BLOCKED_PATTERNS = [
-        r"os\.\s*system\s*\(",
-        r"subprocess\.\s*Popen\s*\(",
-        r"shutil\.\s*rmtree\s*\(",
-        r"__import__\s*\(\s*['\"]os['\"]",
-        r"open\s*\(\s*['\"].*vulnclaw.*config",
-        r"open\s*\(\s*['\"].*\.vulnclaw",
-    ]
+    _BLOCKED_PATTERNS = BLOCKED_PATTERNS
 
     async def _execute_nmap(self, args: dict) -> str:
-        """Execute an nmap scan and return structured results.
-
-        Args:
-            target: IP address or hostname to scan (required)
-            scan_type: One of:
-                - top_ports  : Scan top N most common ports (default)
-                - syn        : SYN half-open scan (requires root)
-                - tcp        : Full TCP connect scan
-                - service    : Service and version detection
-                - os         : OS fingerprint detection
-                - vuln       : CVE vulnerability scan via NSE
-                - full       : Full recon (SYN + OS + service + scripts)
-            ports: Comma-separated port list or range (optional, e.g. "80,443,8080" or "1-1000")
-            timing: Timing template 0-5 (default 4, higher = faster but noisier)
-
-        Returns:
-            Structured scan results with ports, services, and OS info.
-        """
-        import shutil
-        import subprocess
-        import xml.etree.ElementTree as ET
-
-        target = args.get("target", "").strip()
-        if not target:
-            return "[!] nmap_scan 需要 target 参数（目标 IP 或域名）"
-
-        # ★ Skip nmap for reserved/internal IPs — these waste rounds and produce meaningless results
-        import socket
-        try:
-            ips = socket.getaddrinfo(target, None, socket.AF_INET)
-            if ips:
-                ip = ips[0][4][0]
-                is_reserved, reason = self._is_reserved_ip(ip)
-                if is_reserved:
-                    return (
-                        f"[SKIP] 目标 {target} 解析到保留/内网地址 ({reason}, IP: {ip})\n"
-                        f"跳过 nmap 扫描。建议直接通过 Web 指纹、目录枚举等方法收集信息，"
-                        f"不要在保留地址上浪费轮次。"
-                    )
-        except Exception:
-            pass
-
-        scan_type = args.get("scan_type", "top_ports")
-        custom_ports = args.get("ports", "")
-        timing = int(args.get("timing", 4))
-
-        # Find nmap binary
-        nmap_cmd = shutil.which("nmap")
-        if not nmap_cmd:
-            # Try Windows where.exe
-            try:
-                result = subprocess.run(
-                    ["where.exe", "nmap"], capture_output=True, text=True, timeout=10
-                )
-                if result.returncode == 0:
-                    nmap_cmd = result.stdout.strip().split("\n")[0]
-            except Exception:
-                pass
-        if not nmap_cmd:
-            return "[!] nmap 未安装或不在 PATH 中。请确认 nmap 已安装并加入系统 PATH。"
-
-        # Build base command
-        cmd = [nmap_cmd, "-v" if scan_type == "full" else "-q"]
-
-        # Timing template
-        cmd.extend([f"-T{max(0, min(5, timing))}"])
-
-        # Scan type arguments
-        if scan_type == "top_ports":
-            cmd.extend(["--top-ports", "100", "-oX", "-"])
-        elif scan_type == "syn":
-            cmd.extend(["-sS", "-oX", "-"])
-        elif scan_type == "tcp":
-            cmd.extend(["-sT", "-oX", "-"])
-        elif scan_type == "service":
-            cmd.extend(["-sV", "-oX", "-"])
-        elif scan_type == "os":
-            cmd.extend(["-O", "-oX", "-"])
-        elif scan_type == "vuln":
-            cmd.extend(["--script", "vuln", "-oX", "-"])
-        elif scan_type == "full":
-            cmd.extend(["-sS", "-O", "-sV", "--script", "default,safe", "-oX", "-"])
-        else:
-            cmd.extend(["-sV", "-oX", "-"])
-
-        # Custom ports
-        if custom_ports:
-            cmd.extend(["-p", custom_ports])
-
-        cmd.append(target)
-
-        try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=120,
-            )
-        except subprocess.TimeoutExpired:
-            return "[!] nmap 扫描超时（120秒），请减少扫描范围或使用更快的 timing"
-        except Exception as e:
-            return f"[!] nmap 执行错误: {e}"
-
-        if result.returncode != 0 and not result.stdout:
-            return f"[!] nmap 扫描失败（{result.returncode}）: {result.stderr[:500]}"
-
-        scan_result = self._parse_nmap_xml(result.stdout or result.stderr, target)
-        return scan_result
+        return await execute_nmap(self, args)
 
     # ── Reserved IP detection helpers ─────────────────────────────────
 
-    _RESERVED_IP_RANGES = [
-        ("198.18.0.0", "198.19.255.255", "RFC 2544 基准测试地址"),
-        ("10.0.0.0", "10.255.255.255", "RFC 1918 私有地址"),
-        ("172.16.0.0", "172.31.255.255", "RFC 1918 私有地址"),
-        ("192.168.0.0", "192.168.255.255", "RFC 1918 私有地址"),
-        ("127.0.0.0", "127.255.255.255", "RFC 1122 环回地址"),
-        ("169.254.0.0", "169.254.255.255", "RFC 3927 链路本地"),
-        ("0.0.0.0", "0.255.255.255", "RFC 1122 当前网络"),
-        ("224.0.0.0", "239.255.255.255", "RFC 5771 多播地址"),
-        ("240.0.0.0", "255.255.255.255", "RFC 1112 保留地址"),
-    ]
+    _RESERVED_IP_RANGES = RESERVED_IP_RANGES
 
     def _is_reserved_ip(self, ip: str) -> tuple[bool, str]:
-        """Check if an IP is in a reserved/internal range.
-
-        Returns (True, reason) if reserved, (False, "") if public.
-        """
-        try:
-            import ipaddress
-            addr = ipaddress.ip_address(ip)
-            for start, end, desc in self._RESERVED_IP_RANGES:
-                if ipaddress.ip_address(start) <= addr <= ipaddress.ip_address(end):
-                    return True, desc
-            return False, ""
-        except Exception:
-            return False, ""
+        return is_reserved_ip(ip)
 
     def _validate_scan_target(self, target: str) -> str:
-        """Check if target resolves to a reserved IP; warn the LLM.
-
-        Returns a warning string if reserved, empty string if fine.
-        """
-        import socket
-        try:
-            ips = socket.getaddrinfo(target, None, socket.AF_INET)
-            if not ips:
-                return ""
-            ip = ips[0][4][0]
-            is_reserved, reason = self._is_reserved_ip(ip)
-            if is_reserved:
-                return (
-                    f"\n\n⚠️ **警告：目标 {target} 解析到保留/内网地址 ({reason})\n"
-                    f"   IP: {ip}\n"
-                    f"   扫描此地址得到的结果不代表真实系统的安全状态。\n"
-                    f"   nmap 扫描结果中的端口信息可能与真实目标无关。**"
-                )
-        except Exception:
-            pass
-        return ""
+        return validate_scan_target(target)
 
     def _parse_nmap_xml(self, xml_output: str, target: str) -> str:
-        """Parse nmap XML output into a readable summary."""
-        import xml.etree.ElementTree as ET
-
-        if not xml_output or "<nmaprun" not in xml_output:
-            # Fallback: return raw output if XML parsing fails
-            lines = xml_output.strip().splitlines()[:80]
-            return "nmap 原始输出:\n" + "\n".join(lines)
-
-        try:
-            root = ET.fromstring(xml_output)
-        except ET.ParseError:
-            lines = xml_output.strip().splitlines()[:80]
-            return "nmap 原始输出:\n" + "\n".join(lines)
-
-        lines = [f"nmap 扫描结果 — {target}"]
-        lines.append("=" * 60)
-
-        # Parse host info
-        for host in root.findall(".//host"):
-            hostname = host.find(".//hostname[@type='user']")
-            host_addr = host.find("address[@addr]")
-            addrs = [a.get("addr", "") for a in host.findall("address")]
-            status = host.find("status")
-            status_val = status.get("state", "unknown") if status is not None else "unknown"
-
-            host_ip = addrs[0] if addrs else target
-            is_reserved, reason = self._is_reserved_ip(host_ip)
-            if is_reserved:
-                host_str = f"\n[主机] {host_ip} ⚠️ **保留地址 ({reason})，测试网络结果不代表真实目标安全状态**"
-            else:
-                host_str = f"\n[主机] {host_ip}"
-            if hostname is not None:
-                host_str += f" ({hostname.get('name', '')})"
-            host_str += f" — {status_val}"
-            lines.append(host_str)
-
-            # Ports
-            for port in host.findall(".//port"):
-                port_id = port.get("portid", "")
-                proto = port.get("protocol", "tcp")
-                port_state = port.find("state")
-                svc = port.find("service")
-                state_val = port_state.get("state", "unknown") if port_state is not None else "unknown"
-                svc_name = svc.get("name", "") if svc is not None else ""
-                svc_product = svc.get("product", "") if svc is not None else ""
-                svc_version = svc.get("version", "") if svc is not None else ""
-                lines.append(
-                    f"  {proto.upper():5} {port_id}/{'s' if svc is not None and svc.get('tunnel') == 'ssl' else ''} "
-                    f"{state_val:8}"
-                    f"{svc_name:15}"
-                    f"{svc_product} {svc_version}".rstrip()
-                )
-                # Scripts (for vuln scan)
-                for script in port.findall("script"):
-                    lines.append(f"    | {script.get('id', '')}: {script.get('output', '')[:120]}")
-
-        # Extra info
-        runstats = root.find(".//runstats")
-        if runstats is not None:
-            finished = runstats.find("finished")
-            if finished is not None:
-                elapsed = finished.get("elapsed", "")
-                summary = finished.get("summary", "")
-                lines.append(f"\n完成时间: {elapsed}s | {summary}")
-
-        return "\n".join(lines) or f"nmap 扫描完成（无输出）: {target}"
+        return parse_nmap_xml(xml_output, target)
 
     async def _execute_python(self, args: dict) -> str:
-        """Execute a Python code snippet in a sandboxed subprocess.
+        return await execute_python(self, args)
 
-        The code runs with a timeout (30s default, 60s for recon/info-gathering scripts).
-        stdout and stderr are captured and returned to the LLM.
-        """
-        code = args.get("code", "")
-        purpose = args.get("purpose", "")
-
-        if not code.strip():
-            return "[!] 代码为空，未执行"
-
-        # ★ Determine timeout based on purpose
-        # Recon/info-gathering scripts often need more time for API enumeration
-        _RECON_PURPOSE_KEYWORDS = [
-            "recon", "信息收集", "侦察", "枚举", "扫描", "crawl", "spider",
-            "目录", "子域名", "端口", "指纹", "收集",
-        ]
-        timeout_seconds = 30
-        purpose_lower = purpose.lower()
-        if any(kw in purpose_lower for kw in _RECON_PURPOSE_KEYWORDS):
-            timeout_seconds = 60
-
-        # Sandbox safety: block dangerous patterns
-        for pattern in self._BLOCKED_PATTERNS:
-            if re.search(pattern, code):
-                return f"[!] 代码包含被禁止的操作模式: {pattern}，出于安全原因拒绝执行"
-
-        # Write code to a temp file and execute it
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".py", delete=False, encoding="utf-8"
-            ) as f:
-                # Prepend common imports for convenience
-                preamble = (
-                    "import sys, json, re, os, base64, hashlib, itertools, "
-                    "collections, datetime, struct, binascii, textwrap\n"
-                    "try:\n"
-                    "    import requests\n"
-                    "except ImportError:\n"
-                    "    pass\n"
-                    "try:\n"
-                    "    from bs4 import BeautifulSoup\n"
-                    "except ImportError:\n"
-                    "    pass\n"
-                    "try:\n"
-                    "    from Crypto.Cipher import AES\n"
-                    "except ImportError:\n"
-                    "    pass\n"
-                    "\n"
-                )
-                f.write(preamble)
-                f.write(code)
-                tmp_path = f.name
-
-            # Execute with timeout
-            import asyncio
-            loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None,
-                lambda: subprocess.run(
-                    [sys.executable, tmp_path],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=timeout_seconds,
-                    cwd=tempfile.gettempdir(),
-                    env={**os.environ, "PYTHONIOENCODING": "utf-8"},
-                ),
-            )
-
-            # Clean up temp file
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-            output_parts = []
-            if result.stdout:
-                output_parts.append(result.stdout)
-            if result.stderr:
-                # Filter out import warnings
-                stderr_lines = [
-                    line for line in result.stderr.splitlines()
-                    if "ImportError" not in line and "No module named" not in line
-                ]
-                if stderr_lines:
-                    output_parts.append("[stderr]\n" + "\n".join(stderr_lines))
-
-            if not output_parts:
-                return "[✓] 代码执行成功，无输出"
-
-            output = "\n".join(output_parts)
-            # ★ Strip completion signals from code output to prevent
-            # python_execute from faking a [DONE] that stops the auto loop
-            for sig in ["[DONE]", "[COMPLETE]"]:
-                output = output.replace(sig, f"[BLOCKED_{sig[1:-1]}]")
-            # Truncate if too long
-            if len(output) > 8000:
-                output = output[:4000] + "\n...[中间省略]...\n" + output[-4000:]
-
-            return f"[✓] Python 执行结果:\n{output}"
-
-        except subprocess.TimeoutExpired:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            self._python_timeout_rounds = getattr(self, '_python_timeout_rounds', 0) + 1
-            return f"[!] Python 执行超时（{timeout_seconds}秒），请简化代码或分步执行，禁止写超过10行的复杂脚本"
-        except Exception as e:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            return f"[!] Python 执行错误: {e}"
 
     def _update_recon_dimension_completion(self, response: str) -> None:
-        """Auto-detect which recon dimensions have been explored.
+        """Auto-detect which recon dimensions have been explored."""
+        update_recon_dimension_completion(self, response)
 
-        Checks three sources:
-        1. notes (LLM's natural-language descriptions of discoveries)
-        2. confirmed_facts (verified tool results)
-        3. executed_steps (step log)
 
-        This fixes the previous bug where only tool_result signatures were checked,
-        causing dimensions to never mark complete when LLM describes findings in
-        natural language (notes) rather than tool-result keywords.
-
-        Once a dimension is marked complete, it stays complete.
-        """
-        # Combine notes + confirmed_facts + steps for dimension detection
-        # notes = LLM's natural-language descriptions (rich but not tool-result exact)
-        # confirmed_facts = verified discoveries (high signal)
-        # steps = operation log (contextual)
-        note_text = " ".join(self.context.state.notes[-15:]).lower()
-        fact_text = " ".join(getattr(self.context.state, 'confirmed_facts', [])[-15:]).lower()
-        step_text = " ".join(self.context.state.executed_steps[-15:]).lower()
-        full_context = f"{note_text} {fact_text} {step_text}"
-
-        for dim, keywords in _RECON_DIM_KEYWORDS.items():
-            if dim == "personnel" and not self.context.state.recon_dimension4_active:
-                continue
-            if not self.context.state.recon_dimensions_completed.get(dim, False):
-                if any(kw.lower() in full_context for kw in keywords):
-                    self.context.state.mark_recon_dimension(dim)
-
-    # ── Natural-language vulnerability title patterns ──────────────────────
-    # These detect LLM's natural-language vulnerability descriptions so we can
-    # auto-generate findings WITHOUT requiring [Critical]/[High] tags.
-    # ★ CRITICAL REQUIREMENT: Layer 2 ONLY creates a finding if both:
-    #   (a) a vuln keyword matches AND
-    #   (b) actual proof indicators are present in the response (HTTP diffs, errors, etc.)
-    # This prevents false positives from LLM reasoning text alone.
-    #
-    # Proof indicators that must accompany a vuln keyword to create a finding:
-    #   - "差异 \d+" or "差异:\d+"  → HTTP response length difference
-    #   - "bytes|\d+字节|长度:\d+"     → response size mention
-    #   - "500错误|SQL error|mysql"   → server error message
-    #   - "SLEEP(|BENCHMARK("         → time-based blind injection
-    #   - "EXTRACTVALUE(|UPDATEXML("  → error-based SQL injection
-    #   - "命令执行成功|whoami|id"     → command execution output
-    #   - "root|xampp|apache"         → internal system info leaked
-    #
-    _PROOF_PATTERNS = [
-        r'差异[：:]*\s*\d+',          # 差异:155 / 差异 306
-        r'\d+\s*bytes|\d+\s*字节',    # 52095 bytes / 长度 52095
-        r'(?:状态|响应)?[码代码]*[:：]*\s*5\d{2}',  # 500错误 / 状态码:500
-        r'SQL.*错误|mysql.*error|sql.*error',
-        r'SLEEP\(|BENCHMARK\(|EXTRACTVALUE\(|UPDATEXML\(',
-        r'命令执行成功|whoami|id\s+',
-        r'root[:\s]|administrator',   # privilege indicator
-        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}',  # internal IP leaked
-        r'CVE-\d{4}-\d{4,}',         # CVE mentioned (already a strong signal)
-        r'成功提取|成功获取|获取到',   # data extraction success
-    ]
-
-    _NATURAL_LANG_PATTERNS = [
-        # ── Critical / High severity ──────────────────────────────────────
-        (r'SQL注入|SQLi|注入漏洞', "High", "SQL注入"),
-        (r'RCE|远程代码执行|命令注入|命令执行', "Critical", "远程代码执行"),
-        (r'未授权|未认证|无需认证|认证绕过|认证.*绕过', "High", "认证绕过"),
-        (r'SSRF|服务端请求伪造', "High", "SSRF"),
-        # ── Medium severity ───────────────────────────────────────────────
-        (r'XSS|跨站脚本|存储型XSS|反射型XSS', "Medium", "XSS跨站脚本"),
-        (r'CSRF|跨站请求伪造', "Medium", "CSRF"),
-        (r'文件包含|路径遍历|LFI|RFI', "Medium", "文件包含/遍历"),
-        (r'弱口令|默认口令|默认密码|暴力破解|爆破', "Medium", "弱口令/暴力破解"),
-        (r'配置错误|配置缺陷|泄露.*配置', "Medium", "配置错误"),
-        # ── Low / Info ───────────────────────────────────────────────
-        (r'敏感目录|敏感文件.*发现|目录.*发现', "Info", "敏感目录/文件发现"),
-        (r'版本.*旧|中间件版本|指纹.*识别', "Info", "版本信息"),
-        (r'CVE-\d{4}-\d{4,}', "High", "已知CVE漏洞"),
-    ]
-
-    # ── Security-relevant keywords for note→finding elevation ──────────────
-    # When these appear in confirmed_facts or notes, auto-create a finding
-    _ELEVATION_KEYWORDS = [
-        (r'泄露|敏感信息|数据泄露|个人信息|\d+条数据', "High", "数据泄露"),
-        (r'未授权|未认证|认证绕过|无需认证', "High", "未授权访问"),
-        (r'RCE|命令执行|远程代码', "Critical", "远程代码执行"),
-        (r'SQL注入|SQLi|注入', "High", "注入漏洞"),
-        (r'CVE-\d{4}-\d{4,}', "High", "已知CVE漏洞"),
-        (r'弱口令|默认口令|暴力', "High", "弱口令/暴力破解"),
-        (r'XSS|跨站脚本', "Medium", "XSS"),
-        (r'文件包含|路径遍历', "High", "文件包含/遍历"),
-        (r'返回200.*但.*不存在|200.*空内容|空响应.*但', "Medium", "潜在授权绕过"),
-        (r'403.*接口|接口存在.*403', "Medium", "403认证拦截"),
-    ]
-
-    def _parse_findings(self, response: str) -> None:
-        """Parse vulnerability findings and key discoveries from LLM response.
-
-        Three-layer detection:
-        1. Explicit [Severity] tags (existing, still valid)
-        2. Natural-language vulnerability descriptions → auto-create findings
-        3. Note/confirmed_fact elevation → high-confidence facts become findings
-        """
-        from vulnclaw.agent.context import VulnerabilityFinding
-
-        existing_titles = {f.title for f in self.context.state.findings}
-
-        # ── Layer 1: Explicit severity tags (existing) ─────────────────────
-        patterns = [
-            (r'\[Critical\]\s*(.+?)(?:\n|$)', "Critical"),
-            (r'\[High\]\s*(.+?)(?:\n|$)', "High"),
-            (r'\[Medium\]\s*(.+?)(?:\n|$)', "Medium"),
-            (r'\[Low\]\s*(.+?)(?:\n|$)', "Low"),
-        ]
-        for pattern, severity in patterns:
-            for match in re.findall(pattern, response):
-                title = match.strip()
-                # Clean markdown artifacts from LLM output (e.g. "漏洞** - " → "漏洞")
-                title = re.sub(r'\*+', '', title).strip(' -–—:')
-                if title and title not in existing_titles:
-                    self.context.state.add_finding(VulnerabilityFinding(
-                        title=title,
-                        severity=severity,
-                    ))
-                    existing_titles.add(title)
-
-        # ── Layer 2: Natural-language vulnerability detection ───────────────
-        # LLM describes vulnerabilities in natural Chinese without [Tag] format.
-        # Key fix: use vuln_type as the canonical title (dedup key) rather than
-        # the raw regex match, because:
-        #   1. Patterns without capture groups → match is the full string (too long)
-        #   2. Same vuln type can match multiple wordings → duplicate findings
-        #   3. vuln_type is a curated, human-readable category name
-        # We still extract the first matching snippet as a description detail.
-        #
-        # Enhancement: also extract URLs/paths from response and recent notes
-        # to populate the evidence field, so findings aren't just titles.
-        _URL_RE = re.compile(r'https?://[^\s<>"\')\]]+')
-        # Require at least one alphanumeric segment to avoid Chinese text with slashes
-        _PATH_RE = re.compile(r'(?:/[\w%&=?\-]+)+')
-
-        # Build evidence pool from response + recent notes
-        # Strip think tags to avoid picking up LLM reasoning text as evidence
-        clean_response = strip_think_tags(response)
-        notes = self.context.state.notes
-        if notes:
-            clean_notes = [strip_think_tags(n) for n in notes[-5:]]
-            evidence_pool = clean_response + " " + " ".join(clean_notes)
-        else:
-            evidence_pool = clean_response
-
-        for pattern, severity, vuln_type in self._NATURAL_LANG_PATTERNS:
-            canonical_title = f"[自动] {vuln_type}"
-            if canonical_title in existing_titles:
-                continue  # Already found this type — skip
-
-            # ── Layer 2A: Check if vuln keyword appears in response ────────
-            vuln_matches = re.findall(pattern, clean_response, re.IGNORECASE)
-            if not vuln_matches:
-                continue
-
-            # ── Layer 2B: Require proof indicators before creating a finding ──
-            # Without actual HTTP response evidence (diff/error/data), the LLM is just
-            # speculating. Don't create a finding from pure reasoning.
-            # STRICT mode: require proof OR confirmed_facts — no evidence = no finding.
-            has_proof = any(
-                re.search(p, clean_response + " " + " ".join(notes[-3:]), re.IGNORECASE)
-                for p in self._PROOF_PATTERNS
-            )
-            # Also check confirmed_facts (verified by tool results)
-            has_confirmed_fact = any(
-                re.search(p, " ".join(getattr(self.context.state, 'confirmed_facts', [])), re.IGNORECASE)
-                for p in self._PROOF_PATTERNS
-            )
-            if not has_proof and not has_confirmed_fact:
-                # LLM is speculating — skip creating this finding entirely.
-                # Do NOT create pending findings without any evidence.
-                continue
-
-            # ── Extract actual proof snippets as evidence ──────────────────────
-            proof_snippets = []
-            for p in self._PROOF_PATTERNS:
-                for m in re.finditer(p, evidence_pool, re.IGNORECASE):
-                    snippet = m.group(0).strip()[:80]
-                    if snippet and snippet not in proof_snippets:
-                        proof_snippets.append(snippet)
-                    if len(proof_snippets) >= 3:
-                        break
-
-            # ── Extract URLs/paths from evidence pool for location ──────────
-            urls = re.findall(_URL_RE, evidence_pool)
-            paths = re.findall(_PATH_RE, evidence_pool)
-            seen, unique_urls, unique_paths = set(), [], []
-            for u in urls:
-                if u not in seen:
-                    seen.add(u)
-                    unique_urls.append(u)
-            for p in paths:
-                if p not in seen:
-                    seen.add(p)
-                    unique_paths.append(p)
-
-            location = " | ".join(unique_urls[:2] + unique_paths[:2])
-            proof_text = " | ".join(proof_snippets) if proof_snippets else ""
-            evidence = (location + " | " + proof_text) if proof_text else location
-
-            self.context.state.add_finding(VulnerabilityFinding(
-                title=canonical_title,
-                severity=severity,
-                vuln_type=vuln_type,
-                description=f"自动检测：{vuln_matches[0].strip()[:100]}" if vuln_matches else "通过自然语言模式自动检测",
-                evidence=evidence[:300],
-            ))
-            existing_titles.add(canonical_title)
-
-        # ── Layer 3: confirmed_facts → findings elevation ──────────────────
-        # High-confidence verified facts become findings AND are auto-marked verified
-        # because they come from confirmed tool output, not just LLM reasoning.
-        confirmed_facts = getattr(self.context.state, 'confirmed_facts', [])
-        for fact in confirmed_facts:
-            for pattern, severity, vuln_type in self._ELEVATION_KEYWORDS:
-                if re.search(pattern, fact, re.IGNORECASE):
-                    title = f"[已确认] {fact.strip()[:120]}"
-                    if title not in existing_titles:
-                        finding = VulnerabilityFinding(
-                            title=title,
-                            severity=severity,
-                            vuln_type=vuln_type,
-                            description=f"通过工具验证确认：{fact}",
-                            verified=True,  # ★ Auto-verify: confirmed_facts are tool-verified
-                            verification_status="verified",
-                        )
-                        self.context.state.add_finding(finding)
-                        existing_titles.add(title)
-                    break  # One elevation per fact is enough
-
-        # ── Extract key discoveries as notes ────────────────────────────────
-        # ★ CRITICAL: notes should only record actual tool results and verified facts,
-        # NOT the LLM's reasoning inner monologue. Strip think tags BEFORE extracting
-        # discovery markers, otherwise "<think> 发现了SQL注入...</think>" → "发现了SQL注入"
-        # which looks like a confirmed finding but is just the LLM planning to test.
-        clean_response = strip_think_tags(response)
-
-        discovery_markers = [
-            r'\[\+\]\s*(.+?)(?:\n|$)',        # [+] findings
-            r'发现[：:]\s*(.+?)(?:\n|$)',      # 发现: xxx
-            r'(flag\{[^}]+\})',               # flag{...}
-            r'(NSSCTF\{[^}]+\})',             # NSSCTF{...}
-            r'(CTF\{[^}]+\})',                # CTF{...}
-        ]
-        for pattern in discovery_markers:
-            for match in re.findall(pattern, clean_response, re.IGNORECASE):
-                note = match.strip()[:200]
-                if note and note not in self.context.state.notes:
-                    self.context.state.add_note(note)
-
-        # ── Auto-extract confirmed facts ───────────────────────────────────
-        # ★ Expanded: the original strict patterns missed most LLM confirmations.
-        # LLM says "CAS SQL注入确认存在" or "验证成功，SLEEP(3)耗时3.2秒"
-        # — these don't match the old precise patterns.
-        confirmed_markers = [
-            # Precise (existing)
-            r'已确认[：:]\s*(.+?)(?:\n|$)',
-            r'确认[：:]\s*(.+?)(?:\n|$)',
-            r'验证成功[：:]\s*(.+?)(?:\n|$)',
-            r'\[✅\]\s*(.+?)(?:\n|$)',
-            # ★ Expanded — broad confirmation language
-            r'确认.*存在',                         # "SQL注入确认存在"
-            r'漏洞.*已确认',                       # "漏洞已确认"
-            r'已.*验证.*成功',                     # "已验证成功"
-            r'payload.*差异[：:]*\s*\d+',         # "payload差异: 155" or "差异 155"
-            r'差异[：:]*\s*\d+.*成功',            # "差异306 - 成功"
-            r'SLEEP\([^)]+\).*耗时',             # "SLEEP(3)耗时3.2秒"
-            r'成功提取[：:]*\s*\S+',             # "成功提取到关键信息"
-            r'提取到[：:]*\s*\S+',               # "提取到 root用户"
-            r'命令执行成功',                       # "命令执行成功"
-            r'可提取[：:]*\s*\S+',               # "可提取数据"
-            r'布尔.*成功|布尔.*有效',             # "布尔注入成功"
-            r'报错.*成功|报错.*有效',             # "报错注入成功"
-            r'UNION.*成功|UNION.*有效',           # "UNION SELECT 成功"
-            r'漏洞确认',                           # "SQL注入漏洞确认"
-        ]
-        for pattern in confirmed_markers:
-            for match in re.findall(pattern, response, re.IGNORECASE):
-                fact = match.strip()[:200]
-                if fact and hasattr(self.context.state, 'add_confirmed_fact'):
-                    self.context.state.add_confirmed_fact(fact)
-
-        # ── Auto-extract unverified assumptions ────────────────────────────
-        assumption_markers = [
-            r'假设[：:]\s*(.+?)(?:\n|$)',
-            r'推测[：:]\s*(.+?)(?:\n|$)',
-        ]
-        for pattern in assumption_markers:
-            for match in re.findall(pattern, response, re.IGNORECASE):
-                assumption = match.strip()[:200]
-                if assumption and hasattr(self.context.state, 'add_assumption'):
-                    self.context.state.add_assumption(assumption)

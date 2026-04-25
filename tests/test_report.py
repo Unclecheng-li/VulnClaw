@@ -170,6 +170,7 @@ class TestPoCBuilder:
             severity="Critical",
             vuln_type="SQLi",
             cve="CVE-2026-12345",
+            evidence="http://192.168.1.100/login?id=1",
         ))
         pocs_dir = tmp_path / "pocs"
         paths = generate_pocs(session, pocs_dir)
@@ -178,6 +179,11 @@ class TestPoCBuilder:
         assert "Critical" in content
         assert "CVE-2026-12345" in content
         assert "python3" in content
+        assert "sql_injection" in content
+        assert "requests.get(target, params=params" in content
+        assert "http://192.168.1.100/login?id=1" in content
+        assert "[CONFIRMED] SQL注入漏洞" in content
+
 
     def test_poc_is_valid_python(self, tmp_path):
         """Generated PoC should be syntactically valid Python."""
@@ -220,6 +226,41 @@ class TestPoCBuilder:
         assert isinstance(poc, str)
         assert "SQLi" in poc
         assert "CVE-2026-0001" in poc
+        assert "sql_injection" in poc
+        assert 'params = {' in poc
+        assert 'target = "http://target"' in poc
+
+    def test_generate_single_poc_uses_specific_template_for_rce(self):
+        from vulnclaw.report.poc_builder import generate_single_poc
+
+        poc = generate_single_poc(
+            title="RCE",
+            severity="Critical",
+            target="https://demo.local/exec",
+            vuln_type="RCE",
+        )
+
+        assert "command_injection" in poc
+        assert '"cmd": ";id"' in poc
+        assert 'target = "https://demo.local/exec"' in poc
+
+    def test_generate_pocs_extracts_target_from_evidence(self, tmp_path):
+        from vulnclaw.report.poc_builder import generate_pocs
+        from vulnclaw.agent.context import SessionState, VulnerabilityFinding
+
+        session = SessionState(target="example.com")
+        session.add_finding(VulnerabilityFinding(
+            title="File Inclusion",
+            severity="High",
+            vuln_type="LFI",
+            evidence="可访问地址 https://victim.local/download?file=../../etc/passwd 并返回 root:x:0:0",
+        ))
+
+        paths = generate_pocs(session, tmp_path / "pocs")
+        content = paths[0].read_text(encoding="utf-8")
+        assert 'target = "https://victim.local/download?file=../../etc/passwd"' in content
+        assert "../../../etc/passwd" in content
+
 
     def test_poc_empty_findings(self, tmp_path):
         """No findings should produce no PoC files."""

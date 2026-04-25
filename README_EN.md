@@ -8,7 +8,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI_Compatible-green)](https://platform.openai.com/)
 [![MCP](https://img.shields.io/badge/Toolchain-MCP-orange)](https://modelcontextprotocol.io/)
-[![PyPI](https://img.shields.io/badge/PyPI-v0.2.0-blueviolet)](https://pypi.org/project/vulnclaw/)
+[![PyPI](https://img.shields.io/badge/PyPI-v0.2.5-blueviolet)](https://pypi.org/project/vulnclaw/)
 [![Security](https://img.shields.io/badge/Scope-Authorized_Only-red)](#-security-notice)
 <br>
 
@@ -50,16 +50,16 @@ Suitable for authorized pentests, CTF competitions, security training, and red t
 
 - **Natural Language Driven** — Describe your intent in plain English, it auto-identifies phases and tools
 - **8 LLM Providers** — OpenAI / MiniMax / DeepSeek / Zhipu / Moonshot / Qwen / SiliconFlow, one-command switch
-- **MCP Toolchain** — 11 security MCP services + 23 tool definitions (fetch / Burp / Frida / Chrome DevTools / IDA Pro etc.)
+- **MCP Toolchain** — Ships with 11 MCP service configs and 23 tool definitions; `fetch` / `memory` currently run in stable `local` mode, while most other MCP integrations remain preview or placeholder until full session lifecycle management is completed
 - **AI Agent Core** — OpenAI-compatible protocol + Tool Calling + autonomous pentest loop
 - **20 Pentest Skills** — 7 core + 13 specialized skills (incl. CTF Web/Crypto/Misc + osint-recon), 138 reference documents
 - **Encode/Decode & Crypto Tools** — 29 operations (Base64/Hex/URL/AES/JWT/Morse etc.), LLM calls them directly, no guessing
-- **Python Code Execution** — Built-in `python_execute` tool, LLM writes Python scripts to precisely craft payloads and parse responses
+- **Python Code Execution** — Built-in `python_execute` tool for payload crafting and response parsing; currently still a high-risk experimental capability, not a strong isolation sandbox
 - **Persistent Pentesting** — Cyclic runs (100 rounds/cycle × 10 cycles = 1000 rounds), auto-reports every cycle, runs until you stop it
 - **Thinking Process Control** — `think on/off` toggles LLM reasoning visibility, off by default for clean output
 - **Sandbox Mode Prompting** — Unlocks AI security testing capabilities, designed for CTF and authorized pentest scenarios
 - **Auto Report & PoC** — Generates structured Markdown reports and runnable Python PoC scripts
-- **Security Knowledge Base** — Built-in CVE database, WAF bypass techniques, exploitation methods
+- **Security Knowledge Base** — Includes the KB module and baseline seed data today; retrieval augmentation is being integrated into the main workflow incrementally
 
 ---
 
@@ -358,7 +358,7 @@ vulnclaw config provider minimax   # one-command switch
 | Module              | File                                                  | Description                                        |
 | ------------------- | ----------------------------------------------------- | -------------------------------------------------- |
 | **CLI Entry**       | `cli/main.py`                                        | Typer REPL + 9 subcommands (incl. persistent)      |
-| **Agent Core**      | `agent/core.py`                                      | OpenAI SDK + Tool Calling + autonomous loop + persistent + think filtering |
+| **Agent Core**      | `agent/core.py`                                      | AgentCore coordination entrypoint (main loops, LLM, tool orchestration, and recon logic are being split into focused modules) |
 | **Dynamic Prompts** | `agent/prompts.py`                                   | Base identity + core contract + skills + MCP tools  |
 | **Session State**   | `agent/context.py`                                   | Phase tracking + findings + step records            |
 | **MCP Orchestration**| `mcp/registry.py` + `lifecycle.py` + `router.py`    | Service registry + lifecycle + NL→tool routing     |
@@ -388,6 +388,8 @@ vulnclaw config provider minimax   # one-command switch
 | everything-search   | 1     | Local file search             | P2      |
 
 > 11 MCP services, 23 tool definitions total. Plus 3 built-in Agent tools (`load_skill_reference` + `crypto_decode` + `python_execute`) callable without MCP.
+>
+> `fetch` / `memory` currently run in stable `local` mode; most other services remain `preview / placeholder`. Full MCP protocol access will be restored and expanded after a dedicated session lifecycle manager is introduced.
 
 ---
 
@@ -496,8 +498,9 @@ Config file location: `~/.vulnclaw/config.yaml`.
 | v0.1 MVP  | CLI + LLM Agent + basic MCP + Skills + Reports + Multi-Provider          | ✅ Done      |
 | v0.1.1    | `python_execute` + context compression + code audit strategy + anti-hallucination | ✅ Done      |
 | v0.1.2    | 3 CTF specialized Skills + 3 existing Skills updated + trigger words       | ✅ Done      |
-| **v0.1.3**| Four-dimension recon model + RECON_MIN_ROUNDS + dimension completion self-check + social eng conditional trigger + osint-recon Skill | ✅ **Current** |
-| v0.2      | Mobile capabilities (Frida / ADB / JADX) + LLM call optimization          | 🔜 Skills ✅ |
+| v0.1.3    | Four-dimension recon model + RECON_MIN_ROUNDS + dimension completion self-check + social eng conditional trigger + osint-recon Skill | ✅ Done |
+| v0.1.4    | Pentest stability fixes (findings parsing / recon progression / summary filtering / nmap guardrails) | ✅ Done |
+| **v0.2.5**| **Current PyPI release: mobile entrypoints, persistent pentest, stronger built-in tools, and docs alignment** | ✅ **Current** |
 | v0.3      | Reverse engineering (IDA Pro) — Skills ready                              | 📋 Skills ✅ |
 | v0.4      | Knowledge base enhancement (ChromaDB vector retrieval + semantic skill routing)| 📋          |
 | v1.0      | Official release (PyPI + docs + CI/CD)                                    | 📋          |

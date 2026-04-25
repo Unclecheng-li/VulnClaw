@@ -213,6 +213,9 @@ def generate_report(
         recommendations.append("暂无高危发现，建议持续关注安全动态")
 
     # Build template context
+    # ★ 攻击路径摘要（过滤 LLM 原始输出中的 think 标签 / 调试标记）
+    from vulnclaw.report.filter import ReportContentFilter
+    filtered_summary = ReportContentFilter.filter(llm_attack_summary) if llm_attack_summary else ""
     context = {
         "target": session.target or "未指定",
         "started_at": session.started_at,
@@ -232,9 +235,8 @@ def generate_report(
         "rejected_count": len(rejected_findings),
         "pending_count": len(pending_findings),
         "rejected_findings": rejected_findings,
-        # ★ 攻击路径摘要
         "step_summary": session.get_step_summary(),
-        "llm_attack_summary": llm_attack_summary,
+        "llm_attack_summary": filtered_summary,
     }
 
     # Render report
@@ -473,8 +475,10 @@ def generate_persistent_cycle_report(
     # Recent steps (last 20 to avoid bloat)
     recent_steps = session.executed_steps[-20:]
 
-    # ★ 攻击路径摘要
+    # ★ 攻击路径摘要（过滤 LLM 原始输出中的 think 标签 / 调试标记）
     step_summary = session.get_step_summary()
+    from vulnclaw.report.filter import ReportContentFilter
+    filtered_summary = ReportContentFilter.filter(llm_attack_summary) if llm_attack_summary else ""
 
     context = {
         "target": session.target or "未指定",
@@ -494,7 +498,7 @@ def generate_persistent_cycle_report(
         "recent_steps": recent_steps,
         "recommendations": recommendations,
         "step_summary": step_summary,
-        "llm_attack_summary": llm_attack_summary,
+        "llm_attack_summary": filtered_summary,
     }
 
     # Render report

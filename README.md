@@ -8,7 +8,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI_Compatible-green)](https://platform.openai.com/)
 [![MCP](https://img.shields.io/badge/Toolchain-MCP-orange)](https://modelcontextprotocol.io/)
-[![PyPI](https://img.shields.io/badge/PyPI-v0.2.0-blueviolet)](https://pypi.org/project/vulnclaw/)
+[![PyPI](https://img.shields.io/badge/PyPI-v0.2.5-blueviolet)](https://pypi.org/project/vulnclaw/)
 [![Security](https://img.shields.io/badge/Scope-Authorized_Only-red)](#-安全声明)
 <br>
 
@@ -53,16 +53,16 @@ VulnClaw 自动执行：
 
 - **自然语言驱动** — 用人话描述渗透意图，自动识别阶段和工具
 - **8 个 LLM Provider** — OpenAI / MiniMax / DeepSeek / 智谱 / Moonshot / 千问 / SiliconFlow，一键切换
-- **MCP 工具链** — 11 个安全 MCP 服务 + 23 个工具定义（fetch / Burp / Frida / Chrome DevTools / IDA Pro 等）
+- **MCP 工具链** — 已内置 11 个 MCP 服务配置和 23 个工具定义；当前 `fetch` / `memory` 以稳定的 `local` 模式运行，其余 MCP 集成多仍处于预览或占位阶段，待完整 session 生命周期管理落地后再逐步恢复真实协议接入
 - **AI Agent 核心** — OpenAI 兼容协议 + Tool Calling + 自主渗透循环
 - **20 个渗透 Skill** — 7 核心 + 13 专项 Skill（含 CTF Web/Crypto/Misc + osint-recon），含 138 个参考文档
 - **编解码/加解密工具** — 29 种操作（Base64/Hex/URL/AES/JWT/Morse 等），LLM 可精确调用，不再靠猜测
-- **Python 代码执行** — 内置 `python_execute` 工具，LLM 可写 Python 脚本精确构造 payload 和解析响应
+- **Python 代码执行** — 内置 `python_execute` 工具，适合 payload 构造和响应解析；当前仍属高风险实验能力，不应视为强隔离沙箱
 - **持续性渗透测试** — 周期循环（默认 100 轮/周期 × 10 周期 = 1000 轮），每周期自动生成报告，直到手动终止
 - **推理过程显示控制** — `think on/off` 一键切换 LLM 思考过程的显示/隐藏，默认关闭，干净输出只看结论
 - **沙盒模式提示词** — 解锁 AI 安全测试能力，CTF / 授权渗透场景专用
 - **自动报告 & PoC** — 生成结构化 Markdown 报告和可运行的 Python PoC 脚本
-- **安全知识库** — 内置 CVE 数据库、WAF 绕过技巧、漏洞利用方法
+- **安全知识库** — 已内置知识库模块与基础种子数据，CLI 可维护；检索增强正在逐步接入主流程
 
 ---
 
@@ -358,7 +358,7 @@ vulnclaw config provider minimax   # 一键切换
 | 模块           | 文件                                             | 说明                                          |
 | -------------- | ------------------------------------------------ | --------------------------------------------- |
 | **CLI 入口**   | `cli/main.py`                                    | Typer REPL + 9 个子命令（含 persistent）       |
-| **Agent 核心** | `agent/core.py`                                  | OpenAI SDK + Tool Calling + 自主渗透循环 + 持续性渗透 + think 过滤 |
+| **Agent 核心** | `agent/core.py`                                  | AgentCore 协调入口（主循环、LLM、工具与 recon 逻辑已逐步拆分到独立模块） |
 | **动态提示词** | `agent/prompts.py`                               | 基础身份 + 核心契约 + Skill + MCP 工具列表    |
 | **会话状态**   | `agent/context.py`                               | 阶段追踪 + 漏洞发现 + 步骤记录                |
 | **MCP 编排**   | `mcp/registry.py` + `lifecycle.py` + `router.py` | 服务注册 + 生命周期 + 自然语言→工具路由       |
@@ -388,6 +388,8 @@ vulnclaw config provider minimax   # 一键切换
 | everything-search   | 1      | 本地文件搜索           | P2     |
 
 > 共 11 个 MCP 服务、23 个工具定义。另有 3 个内置 Agent 工具（`load_skill_reference` + `crypto_decode` + `python_execute`），无需 MCP 即可调用。
+>
+> 当前 `fetch` / `memory` 以 `local` 模式稳定运行；其余服务多为 `preview / placeholder`。后续会通过独立的 session 生命周期管理层逐步恢复并扩展真实 MCP 协议接入。
 
 ---
 
@@ -496,8 +498,9 @@ vulnclaw config set session.show_thinking false # 隐藏推理过程（也可在
 | v0.1 MVP | CLI + LLM Agent + 基础 MCP + Skill + 报告 + 多 Provider | ✅ 已完成  |
 | v0.1.1   | `python_execute` + 上下文压缩 + 代码审计策略 + 反幻觉  | ✅ 已完成  |
 | v0.1.2   | 3 个 CTF 专项 Skill + 3 个现有 Skill 更新 + 触发词扩展 | ✅ 已完成  |
-| **v0.1.3** | **四维信息收集模型 + RECON_MIN_ROUNDS + 维度完成度自检 + 社工条件触发 + osint-recon Skill** | ✅ **当前** |
-| v0.2     | 移动端能力（Frida / ADB / JADX）+ LLM 调用优化          | 🔜 Skill ✅ |
+| v0.1.3   | 四维信息收集模型 + RECON_MIN_ROUNDS + 维度完成度自检 + 社工条件触发 + osint-recon Skill | ✅ 已完成 |
+| v0.1.4   | 渗透问题诊断修复（findings 解析 / 信息收集推进 / 摘要过滤 / nmap 安全阀） | ✅ 已完成 |
+| **v0.2.5** | **当前 PyPI 版本：移动端能力入口补齐、持续性渗透、内置工具增强与文档校准** | ✅ **当前** |
 | v0.3     | 逆向能力（IDA Pro）— Skill 已就绪                       | 📋 Skill ✅ |
 | v0.4     | 知识库增强（ChromaDB 向量检索 + 语义 Skill 调度）       | 📋         |
 | v1.0     | 正式发布（PyPI + 文档 + CI/CD）                         | 📋         |

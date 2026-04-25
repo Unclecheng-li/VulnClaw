@@ -655,7 +655,7 @@ class ContextManager:
         self.messages = []
         if summary:
             self.messages.append({
-                "role": "user",
+                "role": "system",
                 "content": f"[之前的会话摘要]\n{summary}",
             })
         self.messages.extend(recent)

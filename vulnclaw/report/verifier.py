@@ -314,17 +314,18 @@ except Exception as e:
             # 通用 PoC 模板
             template = cls._generic_template()
 
-        # 填充模板
         payload = cls._guess_payload(finding)
-        try:
-            return template.format(
-                target=target,
-                payload=payload,
-                baseline_len=baseline_len,
-            )
-        except KeyError:
-            # 模板不需要所有占位符
-            return template.format(target=target, payload=payload)
+        replacements = {
+            "{target}": target,
+            "{payload}": payload,
+            "{baseline_len}": str(baseline_len),
+            "{path}": payload,
+        }
+        for placeholder, value in replacements.items():
+            template = template.replace(placeholder, value)
+        return template
+
+
 
     @classmethod
     def _generic_template(cls) -> str:

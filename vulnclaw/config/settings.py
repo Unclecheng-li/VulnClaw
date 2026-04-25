@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, Optional
 
@@ -92,8 +93,9 @@ def set_config_value(key: str, value: str) -> None:
     field_name = parts[-1]
 
     # Type coercion based on field annotation
-    if hasattr(obj, "model_fields") and field_name in obj.model_fields:
-        field_info = obj.model_fields[field_name]
+    model_fields = getattr(type(obj), "model_fields", {})
+    if field_name in model_fields:
+        field_info = model_fields[field_name]
         annotation = field_info.annotation
         if annotation is int:
             value = int(value)
@@ -101,6 +103,7 @@ def set_config_value(key: str, value: str) -> None:
             value = float(value)
         elif annotation is bool:
             value = value.lower() in ("true", "1", "yes")
+
 
     setattr(obj, field_name, value)
     save_config(config)
@@ -153,22 +156,53 @@ def _deep_merge(base: dict, override: dict) -> None:
 
 
 def _overlay_env(config: VulnClawConfig) -> VulnClawConfig:
-    """Overlay environment variables onto config."""
-    api_key = os.environ.get("VULNCLAW_LLM_API_KEY")
-    if api_key:
-        config.llm.api_key = api_key
+    """Overlay environment variables onto config.
 
-    base_url = os.environ.get("VULNCLAW_LLM_BASE_URL")
-    if base_url:
-        config.llm.base_url = base_url
+    Supported env vars (prefix VULNCLAW_):
+        LLM:        API_KEY, BASE_URL, MODEL, PROVIDER, MAX_TOKENS, TEMPERATURE
+        Session:    OUTPUT_DIR, AUTO_SAVE, REPORT_FORMAT, MAX_ROUNDS, SHOW_THINKING
+        Safety:     PYTHON_EXECUTE_ENABLED, PYTHON_EXECUTE_RESTRICTED,
+                    PYTHON_EXECUTE_MAX_LINES, PYTHON_EXECUTE_SHOW_WARNING
+    """
+    # ── LLM ──────────────────────────────────────────────────────────
+    if v := os.environ.get("VULNCLAW_LLM_API_KEY"):
+        config.llm.api_key = v
+    if v := os.environ.get("VULNCLAW_LLM_BASE_URL"):
+        config.llm.base_url = v
+    if v := os.environ.get("VULNCLAW_LLM_MODEL"):
+        config.llm.model = v
+    if v := os.environ.get("VULNCLAW_LLM_PROVIDER"):
+        config.llm.provider = v
+    if v := os.environ.get("VULNCLAW_LLM_MAX_TOKENS"):
+        with suppress(ValueError):
+            config.llm.max_tokens = int(v)
+    if v := os.environ.get("VULNCLAW_LLM_TEMPERATURE"):
+        with suppress(ValueError):
+            config.llm.temperature = float(v)
 
-    model = os.environ.get("VULNCLAW_LLM_MODEL")
-    if model:
-        config.llm.model = model
+    # ── Session ──────────────────────────────────────────────────────
+    if v := os.environ.get("VULNCLAW_SESSION_OUTPUT_DIR"):
+        config.session.output_dir = Path(v)
+    if v := os.environ.get("VULNCLAW_SESSION_AUTO_SAVE"):
+        config.session.auto_save = v.lower() in ("1", "true", "yes", "on")
+    if v := os.environ.get("VULNCLAW_SESSION_REPORT_FORMAT"):
+        config.session.report_format = v
+    if v := os.environ.get("VULNCLAW_SESSION_MAX_ROUNDS"):
+        with suppress(ValueError):
+            config.session.max_rounds = int(v)
+    if v := os.environ.get("VULNCLAW_SESSION_SHOW_THINKING"):
+        config.session.show_thinking = v.lower() in ("1", "true", "yes", "on")
 
-    provider = os.environ.get("VULNCLAW_LLM_PROVIDER")
-    if provider:
-        config.llm.provider = provider
+    # ── Safety ───────────────────────────────────────────────────────
+    if v := os.environ.get("VULNCLAW_SAFETY_PYTHON_EXECUTE_ENABLED"):
+        config.safety.enable_python_execute = v.lower() in ("1", "true", "yes", "on")
+    if v := os.environ.get("VULNCLAW_SAFETY_PYTHON_EXECUTE_RESTRICTED"):
+        config.safety.python_execute_restricted = v.lower() in ("1", "true", "yes", "on")
+    if v := os.environ.get("VULNCLAW_SAFETY_PYTHON_EXECUTE_MAX_LINES"):
+        with suppress(ValueError):
+            config.safety.python_execute_max_lines = int(v)
+    if v := os.environ.get("VULNCLAW_SAFETY_PYTHON_EXECUTE_SHOW_WARNING"):
+        config.safety.python_execute_show_warning = v.lower() in ("1", "true", "yes", "on")
 
     return config
 

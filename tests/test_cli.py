@@ -20,10 +20,11 @@ class TestCLI:
         assert "VulnClaw" in result.output or "vulnclaw" in result.output.lower()
 
     def test_cli_version(self, runner):
+        from vulnclaw import __version__
         from vulnclaw.cli.main import app
         result = runner.invoke(app, ["--version"])
         # Typer may return exit code 0 or 2 depending on version
-        assert "0.1.0" in result.output or result.exit_code in (0, 2)
+        assert __version__ in result.output or result.exit_code in (0, 2)
 
     def test_cli_init(self, runner):
         from vulnclaw.cli.main import app

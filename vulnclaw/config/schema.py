@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ── LLM Provider Presets ────────────────────────────────────────────
@@ -91,10 +91,10 @@ class MCPTransportConfig(BaseModel):
     """MCP server transport configuration."""
 
     type: str = Field(description="Transport type: stdio, sse")
-    command: Optional[str] = Field(default=None, description="Command to start the server (stdio)")
-    args: Optional[list[str]] = Field(default=None, description="Command arguments")
-    url: Optional[str] = Field(default=None, description="Server URL (sse)")
-    env: Optional[dict[str, str]] = Field(default=None, description="Environment variables")
+    command: str | None = Field(default=None, description="Command to start the server (stdio)")
+    args: list[str] | None = Field(default=None, description="Command arguments")
+    url: str | None = Field(default=None, description="Server URL (sse)")
+    env: dict[str, str] | None = Field(default=None, description="Environment variables")
     startup_timeout: int = Field(default=30000, description="Startup timeout in ms")
     tool_timeout: int = Field(default=300000, description="Tool call timeout in ms")
 
@@ -113,6 +113,27 @@ class MCPServersConfig(BaseModel):
     """All MCP servers configuration."""
 
     servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+
+
+class SafetyConfig(BaseModel):
+    """Safety / sandbox configuration."""
+
+    enable_python_execute: bool = Field(
+        default=True,
+        description="Enable the python_execute built-in tool (disable for safer runs)",
+    )
+    python_execute_restricted: bool = Field(
+        default=False,
+        description="Restricted mode: block file I/O and network in python_execute",
+    )
+    python_execute_max_lines: int = Field(
+        default=50,
+        description="Max lines of code allowed per python_execute call",
+    )
+    python_execute_show_warning: bool = Field(
+        default=True,
+        description="Show a security warning before each python_execute invocation",
+    )
 
 
 class SessionConfig(BaseModel):
@@ -135,16 +156,20 @@ class SessionConfig(BaseModel):
     persistent_auto_report: bool = Field(default=True, description="Auto-generate report after each cycle")
 
 
+
 class VulnClawConfig(BaseModel):
     """Top-level VulnClaw configuration."""
 
     llm: LLMConfig = Field(default_factory=LLMConfig)
     mcp: MCPServersConfig = Field(default_factory=MCPServersConfig)
     session: SessionConfig = Field(default_factory=SessionConfig)
+    safety: SafetyConfig = Field(default_factory=SafetyConfig)
 
-    class Config:
-        env_prefix = "VULNCLAW_"
-        env_nested_delimiter = "__"
+    model_config = ConfigDict(
+        env_prefix="VULNCLAW_",
+        env_nested_delimiter="__",
+    )
+
 
 
 # ── Built-in MCP server definitions (MVP) ──────────────────────────

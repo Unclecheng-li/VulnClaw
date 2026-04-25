@@ -413,6 +413,55 @@ class TestAgentCore:
         prompt = agent._build_system_prompt(target="10.0.0.1", auto_mode=True, user_input="渗透测试")
         assert "自主渗透" in prompt
 
+    def test_recon_personnel_dimension_requires_confirmed_facts(self):
+        agent = self._make_agent()
+        agent.context.state.recon_dimensions_completed = {
+            "server": False,
+            "website": False,
+            "domain": False,
+            "personnel": False,
+        }
+        agent.context.state.recon_dimension4_active = True
+        agent.context.state.notes = ["python_execute 里出现 github.com 和 twitter.com 字符串"]
+        agent.context.state.executed_steps = ["写了一个匹配 github/twitter 链接的脚本"]
+
+        agent._update_recon_dimension_completion("LLM 提到 github 但没有真实结果")
+        assert agent.context.state.recon_dimensions_completed["personnel"] is False
+
+        agent.context.state.add_confirmed_fact("github_id=12345 followers=10 public_repos=3")
+        agent._update_recon_dimension_completion("工具结果确认了 GitHub 账号")
+        assert agent.context.state.recon_dimensions_completed["personnel"] is True
+
+    def test_recon_non_personnel_dimension_can_use_notes_and_steps(self):
+        agent = self._make_agent()
+        agent.context.state.recon_dimensions_completed = {
+            "server": False,
+            "website": False,
+            "domain": False,
+            "personnel": False,
+        }
+        agent.context.state.recon_dimension4_active = False
+        agent.context.state.notes = ["发现开放端口 80 和 443，运行 nginx 服务"]
+        agent.context.state.executed_steps = ["执行了 nmap 端口扫描"]
+
+        agent._update_recon_dimension_completion("端口扫描已完成")
+        assert agent.context.state.recon_dimensions_completed["server"] is True
+
+    def test_trim_summary_uses_system_role(self):
+        from vulnclaw.agent.context import ContextManager
+
+        cm = ContextManager(max_history=5)
+        for i in range(8):
+            if i % 2 == 0:
+                cm.add_user_message(f"用户消息 {i}")
+            else:
+                cm.add_assistant_message(f"[+] 发现端口 {i}")
+
+        messages = cm.get_messages()
+        assert len(messages) <= 5
+        assert messages[0]["role"] == "system"
+        assert "之前的会话摘要" in messages[0]["content"]
+
     def test_completion_signal_detection(self):
         agent = self._make_agent()
         assert agent._is_completion_signal("[DONE]") is True
@@ -422,9 +471,7 @@ class TestAgentCore:
     def test_parse_findings(self):
         agent = self._make_agent()
         response = "[Critical] RCE found in /api/exec\n[High] SQL Injection in login"
-        agent._parse_findings(response)
-        # _parse_findings creates findings from LLM output; dedup may apply
-        # since both lack vuln_type/description, they may share the same finding_id
+        agent._finding_parser.parse(response)
         assert len(agent.session_state.findings) >= 1
         assert agent.session_state.findings[0].severity == "Critical"
 
@@ -438,5 +485,260 @@ class TestAgentCore:
     def test_reset_context(self):
         agent = self._make_agent()
         agent.context.state.target = "10.0.0.1"
+        agent._blocked_targets = {"a.example.com"}
+        agent._claimed_flag = "flag{demo}"
+        agent._flag_verified = True
+        agent._same_path_fail_count = 2
+        agent._user_vuln_hint_rounds = 1
+        agent.context.state.recon_dimension4_active = True
         agent.reset_context()
         assert agent.session_state.target is None
+        assert agent._blocked_targets == set()
+        assert agent._claimed_flag is None
+        assert agent._flag_verified is False
+        assert agent._same_path_fail_count == 0
+        assert agent._user_vuln_hint_rounds == 0
+        assert agent.context.state.recon_dimension4_active is False
+
+    def test_reset_runtime_state_for_recon_initializes_expected_fields(self):
+        from vulnclaw.agent.context import PentestPhase
+
+        agent = self._make_agent()
+        agent._reset_runtime_state(
+            user_input="对 example.com 做社工和信息收集，顺便找flag",
+            detected_phase=PentestPhase.RECON,
+        )
+
+        assert agent._auto_skill_input == "对 example.com 做社工和信息收集，顺便找flag"
+        assert agent._is_recon_phase is True
+        assert agent._is_ctf_mode is True
+        assert agent._claimed_flag is None
+        assert agent._flag_verified is False
+        assert agent._flag_claim_count == 0
+        assert agent._post_flag_rounds == 0
+        assert agent._rounds_without_progress == 0
+        assert agent._python_timeout_rounds == 0
+        assert agent._blocked_targets == set()
+        assert agent._failed_targets == {}
+        assert agent._seen_step_signatures == set()
+        assert agent._current_attack_path is None
+        assert agent._same_path_fail_count == 0
+        assert agent._path_switch_forced is False
+        assert agent._consecutive_errors == 0
+        assert agent.context.state.recon_dimension4_active is True
+        assert agent.context.state.recon_dimensions_completed == {
+            "server": False,
+            "website": False,
+            "domain": False,
+            "personnel": False,
+        }
+
+    def test_agent_init_sets_runtime_defaults(self):
+        agent = self._make_agent()
+        assert agent._auto_skill_input == ""
+        assert agent._user_vuln_hint == ""
+        assert agent._user_vuln_hint_rounds == 0
+        assert agent._claimed_flag is None
+        assert agent._flag_verified is False
+        assert agent._flag_claim_count == 0
+        assert agent._post_flag_rounds == 0
+        assert agent._is_recon_phase is False
+        assert agent._rounds_without_progress == 0
+        assert agent._python_timeout_rounds == 0
+        assert agent._seen_step_signatures == set()
+        assert agent._current_attack_path is None
+        assert agent._same_path_fail_count == 0
+        assert agent._path_switch_forced is False
+        assert agent._failed_targets == {}
+        assert agent._blocked_targets == set()
+        assert agent._unverified_assumptions == []
+        assert agent._is_ctf_mode is False
+        assert agent._consecutive_errors == 0
+
+    def test_build_round_context_consumes_user_vuln_hint_rounds(self):
+        from vulnclaw.agent.context import PentestPhase
+
+        agent = self._make_agent()
+        agent.context.state.advance_phase(PentestPhase.VULN_DISCOVERY)
+        agent._reset_runtime_state(
+            user_input="测试 https://example.com/login 的 SQL注入",
+            detected_phase=PentestPhase.VULN_DISCOVERY,
+        )
+
+        round1 = agent._build_round_context(1, 5)
+        assert "用户明确提示" in round1
+        assert "第 1/3 轮" in round1
+        assert agent._user_vuln_hint_rounds == 2
+
+        round2 = agent._build_round_context(2, 5)
+        assert "第 2/2 轮" in round2
+        assert agent._user_vuln_hint_rounds == 1
+
+    def test_reset_runtime_state_clears_previous_run_contamination(self):
+        from vulnclaw.agent.context import PentestPhase
+
+        agent = self._make_agent()
+        agent._blocked_targets = {"old.example.com"}
+
+        agent._failed_targets = {"old.example.com": 3}
+        agent._claimed_flag = "flag{old}"
+        agent._flag_verified = True
+        agent._flag_claim_count = 7
+        agent._post_flag_rounds = 2
+        agent._rounds_without_progress = 5
+        agent._python_timeout_rounds = 4
+        agent._current_attack_path = "regex_bypass"
+        agent._same_path_fail_count = 3
+        agent._path_switch_forced = True
+        agent._consecutive_errors = 2
+        agent._user_vuln_hint = "old hint"
+        agent._user_vuln_hint_rounds = 9
+        agent.context.state.recon_dimension4_active = True
+        agent.context.state.recon_dimensions_completed = {
+            "server": True,
+            "website": True,
+            "domain": True,
+            "personnel": True,
+        }
+
+        agent._reset_runtime_state(
+            user_input="测试 https://example.com/login 的 SQL注入",
+            detected_phase=PentestPhase.VULN_DISCOVERY,
+        )
+
+        assert agent._is_recon_phase is False
+        assert agent._is_ctf_mode is False
+        assert agent._blocked_targets == set()
+        assert agent._failed_targets == {}
+        assert agent._claimed_flag is None
+        assert agent._flag_verified is False
+        assert agent._flag_claim_count == 0
+        assert agent._post_flag_rounds == 0
+        assert agent._rounds_without_progress == 0
+        assert agent._python_timeout_rounds == 0
+        assert agent._current_attack_path is None
+        assert agent._same_path_fail_count == 0
+        assert agent._path_switch_forced is False
+        assert agent._consecutive_errors == 0
+        assert agent._user_vuln_hint
+        assert agent._user_vuln_hint_rounds == 3
+        assert agent.context.state.recon_dimension4_active is False
+        assert agent.context.state.recon_dimensions_completed == {
+            "server": False,
+            "website": False,
+            "domain": False,
+            "personnel": False,
+        }
+
+
+class TestAgentCoreLoop:
+    """State-machine-level tests for auto_pentest / persistent_pentest loops."""
+
+    def _make_agent(self):
+        from vulnclaw.agent.core import AgentCore
+        from vulnclaw.config.schema import VulnClawConfig
+        config = VulnClawConfig()
+        config.llm.model = "gpt-4o-mini"
+        config.llm.api_key = "sk-test"
+        return AgentCore(config=config)
+
+    @pytest.mark.asyncio
+    async def test_auto_pentest_stops_on_done_signal(self):
+        agent = self._make_agent()
+
+        async def _fake_call_llm_auto(system_prompt, round_context):
+            return "本轮未发现新漏洞，准备总结。\n[DONE]"
+
+        agent._call_llm_auto = _fake_call_llm_auto
+        # Use input that skips recon (so RECON_MIN_ROUNDS doesn't block [DONE])
+        results = await agent.auto_pentest("扫描 example.com 的 SQL注入漏洞", max_rounds=5)
+
+        assert len(results) == 1
+        assert results[0].should_continue is False
+
+    @pytest.mark.asyncio
+    async def test_auto_pentest_ctf_flag_state_machine(self):
+        agent = self._make_agent()
+        round_responses = [
+            "发现可疑文件，尝试读取。\nflag{test123}",
+            "验证 flag{test123} 正确，flag 获取成功！",
+            "总结：成功获取 flag{test123}，任务完成。\n[DONE]",
+        ]
+        call_idx = 0
+
+        async def _fake_call_llm_auto(system_prompt, round_context):
+            nonlocal call_idx
+            text = round_responses[call_idx]
+            call_idx += 1
+            return text
+
+        agent._call_llm_auto = _fake_call_llm_auto
+        results = await agent.auto_pentest("NSSCTF 解题找 flag", max_rounds=10)
+
+        # Should claim flag on round 1
+        assert agent._claimed_flag == "flag{test123}"
+        # Should verify on round 2 (verification markers in response)
+        assert agent._flag_verified is True
+        # Post-flag safety exit should limit extra rounds
+        assert len(results) <= 4
+        assert results[-1].should_continue is False
+
+    @pytest.mark.asyncio
+    async def test_auto_pentest_dead_loop_detects_same_path(self):
+        agent = self._make_agent()
+
+        async def _fake_call_llm_auto(system_prompt, round_context):
+            # Same wording every round, with an attack-path keyword
+            return "尝试 sql注入测试，使用 UNION SELECT，未成功。"
+
+        agent._call_llm_auto = _fake_call_llm_auto
+        results = await agent.auto_pentest("扫描 example.com 的 SQL注入漏洞", max_rounds=5)
+
+        # Same path repeated without progress → counter increases
+        assert agent._same_path_fail_count >= 3
+        assert agent._rounds_without_progress >= 3
+        # Should still stop at max_rounds (no [DONE])
+        assert len(results) == 5
+
+    @pytest.mark.asyncio
+    async def test_auto_pentest_blocks_repeatedly_failed_target(self):
+        agent = self._make_agent()
+
+        async def _fake_call_llm_auto(system_prompt, round_context):
+            return "访问 https://victim.local/admin 访问失败，连接超时。"
+
+        agent._call_llm_auto = _fake_call_llm_auto
+        results = await agent.auto_pentest("测试 victim.local", max_rounds=5)
+
+        # victim.local should be tracked as failed
+        assert "victim.local" in agent._failed_targets
+        assert agent._failed_targets["victim.local"] >= 3
+        # After 3 failures it should be blocked
+        assert "victim.local" in agent._blocked_targets
+
+
+    @pytest.mark.asyncio
+    async def test_persistent_pentest_aggregates_cycles(self):
+        agent = self._make_agent()
+        cycle_count = 0
+
+        async def _fake_auto_pentest(*args, **kwargs):
+            nonlocal cycle_count
+            cycle_count += 1
+            from vulnclaw.agent.runtime_state import AgentResult
+            return [AgentResult(output=f"cycle {cycle_count}", should_continue=False)]
+
+        agent.auto_pentest = _fake_auto_pentest
+        cycle_results = await agent.persistent_pentest(
+            "持续测试 target",
+            max_cycles=3,
+            rounds_per_cycle=5,
+        )
+
+        assert len(cycle_results) == 3
+        assert cycle_results[0].cycle_num == 1
+        assert cycle_results[-1].cycle_num == 3
+        assert all(cr.total_steps >= 0 for cr in cycle_results)
+
+
+

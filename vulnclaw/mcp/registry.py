@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+
 
 from pydantic import BaseModel, Field
 
@@ -26,10 +27,12 @@ class MCPServerState(BaseModel):
 
     name: str
     running: bool = False
-    pid: Optional[int] = None
+    pid: int | None = None
     tools: list[str] = Field(default_factory=list)
-    error: Optional[str] = None
-    started_at: Optional[str] = None
+    error: str | None = None
+    started_at: str | None = None
+    execution_mode: str = "placeholder"  # local/sdk/subprocess/sse/placeholder
+
 
 
 class MCPRegistry:
@@ -61,10 +64,19 @@ class MCPRegistry:
                 from datetime import datetime
                 self._servers[name].started_at = datetime.now().isoformat()
 
+    def set_server_execution_mode(self, name: str, mode: str) -> None:
+        """Update server execution mode: local/sdk/subprocess/sse/placeholder."""
+        if name in self._servers:
+            self._servers[name].execution_mode = mode
+
     def set_server_error(self, name: str, error: str) -> None:
         """Record a server error."""
         if name in self._servers:
             self._servers[name].error = error
+
+
+
+
 
     def register_tool(self, server_name: str, tool_schema: dict[str, Any]) -> None:
         """Register a tool from an MCP server."""

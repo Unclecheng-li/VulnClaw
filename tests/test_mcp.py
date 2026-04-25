@@ -217,3 +217,58 @@ class TestMCPLifecycleManager:
             )
         except Exception:
             pass  # Expected to fail for unknown tool
+
+    def test_fetch_falls_back_to_local_mode_when_sdk_attach_fails(self):
+        from vulnclaw.mcp.lifecycle import MCPLifecycleManager
+        from vulnclaw.config.schema import BUILTIN_MCP_SERVERS, MCPServerConfig, VulnClawConfig
+
+        manager = MCPLifecycleManager(VulnClawConfig())
+        manager.registry.register_server("fetch")
+        manager._try_attach_stdio_client = MagicMock(return_value=False)
+        fetch_config = MCPServerConfig(**BUILTIN_MCP_SERVERS["fetch"])
+
+        assert manager._start_server("fetch", fetch_config) is True
+        state = manager.registry.get_all_servers()["fetch"]
+        assert state.execution_mode == "local"
+
+    def test_fetch_starts_in_local_mode(self):
+        from vulnclaw.mcp.lifecycle import MCPLifecycleManager
+        from vulnclaw.config.schema import BUILTIN_MCP_SERVERS, MCPServerConfig, VulnClawConfig
+
+        manager = MCPLifecycleManager(VulnClawConfig())
+        manager.registry.register_server("fetch")
+        fetch_config = MCPServerConfig(**BUILTIN_MCP_SERVERS["fetch"])
+
+        assert manager._start_server("fetch", fetch_config) is True
+        state = manager.registry.get_all_servers()["fetch"]
+        assert state.execution_mode == "local"
+
+    def test_memory_falls_back_to_local_mode_when_sdk_attach_fails(self):
+        from vulnclaw.mcp.lifecycle import MCPLifecycleManager
+        from vulnclaw.config.schema import BUILTIN_MCP_SERVERS, MCPServerConfig, VulnClawConfig
+
+        manager = MCPLifecycleManager(VulnClawConfig())
+        manager.registry.register_server("memory")
+        manager._try_attach_stdio_client = MagicMock(return_value=False)
+        memory_config = MCPServerConfig(**BUILTIN_MCP_SERVERS["memory"])
+
+        assert manager._start_server("memory", memory_config) is True
+        state = manager.registry.get_all_servers()["memory"]
+        assert state.execution_mode == "local"
+
+    def test_memory_starts_in_local_mode(self):
+        from vulnclaw.mcp.lifecycle import MCPLifecycleManager
+        from vulnclaw.config.schema import BUILTIN_MCP_SERVERS, MCPServerConfig, VulnClawConfig
+
+        manager = MCPLifecycleManager(VulnClawConfig())
+        manager.registry.register_server("memory")
+        memory_config = MCPServerConfig(**BUILTIN_MCP_SERVERS["memory"])
+
+        assert manager._start_server("memory", memory_config) is True
+        state = manager.registry.get_all_servers()["memory"]
+        assert state.execution_mode == "local"
+
+
+
+
+

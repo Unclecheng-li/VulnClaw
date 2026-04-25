@@ -10,6 +10,15 @@ from typing import Any, Optional
 from vulnclaw.config.schema import VulnClawConfig, MCPServerConfig
 from vulnclaw.mcp.registry import MCPRegistry
 
+try:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+except ImportError:  # pragma: no cover - optional runtime dependency
+    ClientSession = None
+    StdioServerParameters = None
+    stdio_client = None
+
+
 
 class MCPLifecycleManager:
     """Manages the lifecycle of MCP servers: start, stop, health check.
@@ -43,26 +52,38 @@ class MCPLifecycleManager:
     def _start_server(self, name: str, config: MCPServerConfig) -> bool:
         """Start a single MCP server.
 
-        For MVP, we just register the server and its known tools.
-        Actual process management will be enhanced with MCP SDK.
+        Current execution modes:
+        - fetch/memory: local implementation (usable now, no external MCP process)
+        - stdio/sse others: placeholder registration only, not true protocol startup yet
         """
         transport = config.transport
 
-        if transport.type == "stdio":
-            # Register the server — actual subprocess launch deferred to MCP SDK
-            self.registry.set_server_running(name, running=True)
+        if name in {"fetch", "memory"}:
+            self.registry.set_server_running(name, running=False)
+            self.registry.set_server_execution_mode(name, "local")
             self._register_known_tools(name)
             return True
 
-        elif transport.type == "sse":
-            # SSE servers are assumed to be already running
-            self.registry.set_server_running(name, running=True)
+        if transport.type == "stdio":
+            self.registry.set_server_running(name, running=False)
+            self.registry.set_server_execution_mode(name, "placeholder")
+            self._register_known_tools(name)
+            return True
+
+        if transport.type == "sse":
+            self.registry.set_server_running(name, running=False)
+            self.registry.set_server_execution_mode(name, "placeholder")
             self._register_known_tools(name)
             return True
 
         return False
 
+
+
+
+
     def _register_known_tools(self, server_name: str) -> None:
+
         """Register known tools for a server based on its type.
 
         This is a temporary approach for MVP. In production, tools will be
@@ -386,14 +407,17 @@ class MCPLifecycleManager:
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> Any:
         """Call an MCP tool by name.
 
-        For MVP, this uses direct subprocess/httpx calls.
-        In later versions, this will use proper MCP protocol.
+        fetch/memory currently run via local implementations.
+        Other servers still mostly expose schemas only.
         """
+
         server_name = self.registry.get_server_for_tool(tool_name)
         if not server_name:
             raise ValueError(f"Unknown tool: {tool_name}")
 
-        # Route to appropriate handler
+        server_state = self.registry.get_all_servers().get(server_name)
+        mode = server_state.execution_mode if server_state else "unknown"
+
         if server_name == "fetch" and tool_name == "fetch":
             return await self._call_fetch(arguments)
         elif server_name == "memory":
@@ -403,8 +427,10 @@ class MCPLifecycleManager:
         elif server_name == "burp":
             return await self._call_burp(tool_name, arguments)
         else:
-            # Generic: try to forward via MCP protocol
-            return f"[!] MCP 工具 '{tool_name}' 尚未实现直接调用，请通过 shell 执行"
+            return (
+                f"[!] MCP 工具 '{tool_name}' 当前为 {mode} 模式，尚未实现真实协议调用。"
+                f"可用于 schema 暴露与路由提示，但不能直接执行。"
+            )
 
     async def _call_fetch(self, args: dict) -> str:
         """Execute a fetch request using httpx."""

@@ -96,7 +96,7 @@ def _run_repl() -> None:
     # Initialize MCP lifecycle manager
     mcp_manager = MCPLifecycleManager(config)
     started = mcp_manager.start_enabled_servers()
-    console.print(f"[*] MCP 工具链: {started} 个服务已启动")
+    console.print(f"[*] MCP 工具链: {started} 个服务已注册")
 
     # Initialize agent
     agent = AgentCore(config, mcp_manager)
@@ -494,7 +494,7 @@ def persistent(
 
     mcp_manager = MCPLifecycleManager(config)
     started = mcp_manager.start_enabled_servers()
-    console.print(f"[*] MCP 工具链: {started} 个服务已启动\n")
+    console.print(f"[*] MCP 工具链: {started} 个服务已注册\n")
 
     agent = AgentCore(config, mcp_manager)
 
@@ -831,7 +831,13 @@ def doctor() -> None:
     for name, srv in config.mcp.servers.items():
         status = "[green]已启用[/]" if srv.enabled else "[dim]未启用[/]"
         priority_label = {0: "P0", 1: "P1", 2: "P2"}.get(srv.priority, "??")
-        console.print(f"  {name}: {status} [{priority_label}]")
+        mode = "local" if name in {"fetch", "memory"} else "placeholder"
+        console.print(f"  {name}: {status} [{priority_label}] mode={mode}")
+
+
+    console.print("[dim]说明：当前 doctor 只检查配置启用状态；部分 MCP 服务仍为预览/占位实现，启用不代表已完成真实协议接入。[/]")
+    console.print("[yellow]⚠️ python_execute 为高风险实验性能力：当前仅做基础模式拦截，不是强隔离沙箱；仅建议在授权靶场或本地可控环境中开启。[/]")
+    console.print("[dim]知识库命令已预留，但当前仍以基础维护为主，检索增强尚未完整接入主流程。[/]")
 
     console.print()
     if has_key:
