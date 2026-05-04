@@ -53,6 +53,14 @@ class TestReportGenerator:
         path = generate_report(session, output)
         assert path.exists()
 
+    def test_generate_html_report(self, tmp_path):
+        from vulnclaw.report.generator import generate_report
+        session = self._make_session()
+        output = str(tmp_path / "report.md")
+        path = generate_report(session, output, report_format="html")
+        assert path.suffix == ".html"
+        assert path.exists()
+
     def test_report_contains_target(self, tmp_path):
         from vulnclaw.report.generator import generate_report
         session = self._make_session()
@@ -134,6 +142,13 @@ class TestReportGenerator:
         except Exception:
             # Might fail if SESSIONS_DIR not writable, that's ok for test
             pass
+
+    def test_report_respects_output_suffix(self, tmp_path):
+        from vulnclaw.report.generator import generate_report
+        session = self._make_session()
+        output = str(tmp_path / "report.custom")
+        path = generate_report(session, output, report_format="markdown")
+        assert path.suffix == ".custom"
 
 
 # ── poc_builder.py ───────────────────────────────────────────────────

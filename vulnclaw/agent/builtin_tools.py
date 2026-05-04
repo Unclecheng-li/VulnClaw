@@ -484,7 +484,7 @@ async def execute_python(agent: Any, args: dict[str, Any]) -> str:
             os.unlink(tmp_path)
         except OSError:
             pass
-        agent._python_timeout_rounds += 1
+        agent.runtime.python_timeout_rounds += 1
         return f"[!] Python 执行超时（{timeout_seconds}秒），请简化代码或分步执行，禁止写超过10行的复杂脚本"
     except Exception as e:
         try:

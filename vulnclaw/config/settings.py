@@ -24,7 +24,7 @@ from .schema import (
 
 # ── Paths ──────────────────────────────────────────────────────────
 
-CONFIG_DIR = Path.home() / ".vulnclaw"
+CONFIG_DIR = Path(os.environ.get("VULNCLAW_CONFIG_DIR", str(Path.home() / ".vulnclaw")))
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
 KB_DIR = CONFIG_DIR / "kb"

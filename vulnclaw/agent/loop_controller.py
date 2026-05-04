@@ -7,6 +7,8 @@ from collections import Counter
 from typing import Any, Callable
 
 from vulnclaw.agent.context import PentestPhase
+from vulnclaw.agent.llm_client import call_llm_auto
+from vulnclaw.agent.ctf_mode import update_ctf_state
 from vulnclaw.agent.runtime_state import AgentResult, PersistentCycleResult
 
 RECON_MIN_ROUNDS = 8
@@ -46,31 +48,13 @@ async def auto_pentest(
         round_context = agent._build_round_context(round_num, max_rounds)
 
         try:
-            response_text = await agent._call_llm_auto(system_prompt, round_context)
+            response_text = await call_llm_auto(agent, system_prompt, round_context)
             result.output = response_text
             agent.context.add_assistant_message(f"[Round {round_num} 分析] {response_text}")
             agent._finding_parser.parse(response_text)
 
-            if agent._is_recon_phase:
+            if agent.runtime.is_recon_phase:
                 agent._update_recon_dimension_completion(response_text)
-
-            if agent._claimed_flag and not agent._flag_verified:
-                verification_markers = [
-                    "验证成功", "验证通过", "已验证", "复现成功", "确认flag",
-                    "verified", "confirmed", "flag正确", "提交成功",
-                    "flag 获取成功", "flag获取成功", "获取成功", "找到flag",
-                    "flag found", "成功获取", "获取了flag", "拿到了flag",
-                    "成功拿到", "成功找到", "解题完成", "解题成功",
-                ]
-                if any(m in response_text.lower() for m in verification_markers):
-                    agent._flag_verified = True
-
-            if agent._is_ctf_mode and agent._claimed_flag and not agent._flag_verified:
-                flag_in_notes_count = sum(1 for note in agent.context.state.notes if agent._claimed_flag in note)
-                if flag_in_notes_count >= 2:
-                    agent._flag_verified = True
-                elif flag_in_notes_count >= 1 and agent._claimed_flag in response_text:
-                    agent._flag_verified = True
 
             new_phase = agent._detect_phase_from_output(response_text)
             if new_phase and new_phase != agent.context.state.phase:
@@ -79,41 +63,23 @@ async def auto_pentest(
 
             result.should_continue = not agent._is_completion_signal(response_text)
 
-            claimed_flag = agent._detect_flag_claim(response_text)
-            if claimed_flag:
-                if not agent._claimed_flag:
-                    agent._claimed_flag = claimed_flag
-                    agent._flag_verified = False
-                    result.should_continue = True
-                elif agent._claimed_flag == claimed_flag and not agent._flag_verified:
-                    agent._flag_claim_count += 1
-                    if agent._flag_claim_count >= 3:
-                        agent._flag_verified = True
-                    else:
-                        result.should_continue = True
+            result.should_continue = update_ctf_state(agent, response_text, result.should_continue)
 
-            if agent._is_ctf_mode and not result.should_continue:
-                if not agent._flag_verified or not agent._claimed_flag:
-                    result.should_continue = True
-
-            if agent._is_recon_phase and not result.should_continue:
-                if round_num < RECON_MIN_ROUNDS:
+            if agent.runtime.is_recon_phase and not result.should_continue:
+                if agent.runtime.is_ctf_mode and agent.runtime.flag_verified and agent.runtime.claimed_flag:
+                    pass
+                elif round_num < RECON_MIN_ROUNDS:
                     result.should_continue = True
                 elif not agent.context.state.is_recon_complete():
                     result.should_continue = True
-
-            if agent._flag_verified and agent._claimed_flag:
-                agent._post_flag_rounds += 1
-                if agent._post_flag_rounds >= 2:
-                    result.should_continue = False
 
             step_raw = f"Round {round_num}: {response_text[:100]}..."
             sig = re.sub(r'Round\s*\d+:', '', step_raw).strip()[:60].lower()
             sig = re.sub(r'\s+', '_', sig)
             sig = re.sub(r'[^\w]', '', sig)
 
-            if sig not in agent._seen_step_signatures:
-                agent._seen_step_signatures.add(sig)
+            if sig not in agent.runtime.seen_step_signatures:
+                agent.runtime.seen_step_signatures.add(sig)
                 agent.context.state.add_step(step_raw)
 
             agent._track_failed_target(response_text)
@@ -137,46 +103,46 @@ async def auto_pentest(
             is_meaningful = agent._is_meaningful_step(last_step)
 
             has_new_progress = (
-                current_findings > agent._last_findings_count
-                or (current_notes > agent._last_notes_count and not is_spinning)
-                or (current_steps > agent._last_steps_count + 1 and is_meaningful)
+                current_findings > agent.runtime.last_findings_count
+                or (current_notes > agent.runtime.last_notes_count and not is_spinning)
+                or (current_steps > agent.runtime.last_steps_count + 1 and is_meaningful)
             )
 
             if has_new_progress:
-                agent._rounds_without_progress = 0
-                agent._python_timeout_rounds = 0
+                agent.runtime.rounds_without_progress = 0
+                agent.runtime.python_timeout_rounds = 0
             else:
-                agent._rounds_without_progress += 1
+                agent.runtime.rounds_without_progress += 1
 
-            agent._last_findings_count = current_findings
-            agent._last_notes_count = current_notes
-            agent._last_steps_count = current_steps
+            agent.runtime.last_findings_count = current_findings
+            agent.runtime.last_notes_count = current_notes
+            agent.runtime.last_steps_count = current_steps
 
-            if not has_new_progress and not agent._path_switch_forced:
+            if not has_new_progress and not agent.runtime.path_switch_forced:
                 detected_path = agent._detect_attack_path(response_text)
                 if detected_path:
-                    if detected_path == agent._current_attack_path:
-                        agent._same_path_fail_count += 1
+                    if detected_path == agent.runtime.current_attack_path:
+                        agent.runtime.same_path_fail_count += 1
                     else:
-                        agent._current_attack_path = detected_path
-                        agent._same_path_fail_count = 0
-                        agent._path_switch_forced = False
+                        agent.runtime.current_attack_path = detected_path
+                        agent.runtime.same_path_fail_count = 0
+                        agent.runtime.path_switch_forced = False
             elif has_new_progress:
-                agent._same_path_fail_count = 0
-                agent._path_switch_forced = False
+                agent.runtime.same_path_fail_count = 0
+                agent.runtime.path_switch_forced = False
 
             agent.context.state.save()
 
         except Exception as e:
             result.output = f"[!] Round {round_num} 错误: {e}"
-            agent._consecutive_errors += 1
-            if agent._consecutive_errors >= 3:
+            agent.runtime.consecutive_errors += 1
+            if agent.runtime.consecutive_errors >= 3:
                 result.should_continue = False
             else:
                 result.should_continue = True
                 agent.context.trim_messages(max_messages=20)
         else:
-            agent._consecutive_errors = 0
+            agent.runtime.consecutive_errors = 0
 
         results.append(result)
         if on_step:

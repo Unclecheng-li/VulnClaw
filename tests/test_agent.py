@@ -164,6 +164,30 @@ class TestContextManager:
         assert cm.state.phase == PentestPhase.RECON
 
 
+class TestAgentAutoSave:
+    """Test agent auto-save behavior."""
+
+    def test_auto_save_respects_config(self, monkeypatch, tmp_path):
+        from vulnclaw.agent.core import AgentCore
+        from vulnclaw.config.schema import VulnClawConfig
+        from vulnclaw.agent.context import SessionState
+
+        config = VulnClawConfig()
+        config.session.auto_save = False
+        config.session.output_dir = tmp_path
+
+        agent = AgentCore(config)
+
+        saved = {"count": 0}
+
+        def fake_save(*args, **kwargs):
+            saved["count"] += 1
+
+        monkeypatch.setattr(SessionState, "save", fake_save)
+        agent._maybe_auto_save_session()
+        assert saved["count"] == 0
+
+
 # ── memory.py ────────────────────────────────────────────────────────
 
 class TestMemoryStore:
@@ -485,19 +509,19 @@ class TestAgentCore:
     def test_reset_context(self):
         agent = self._make_agent()
         agent.context.state.target = "10.0.0.1"
-        agent._blocked_targets = {"a.example.com"}
-        agent._claimed_flag = "flag{demo}"
-        agent._flag_verified = True
-        agent._same_path_fail_count = 2
-        agent._user_vuln_hint_rounds = 1
+        agent.runtime.blocked_targets = {"a.example.com"}
+        agent.runtime.claimed_flag = "flag{demo}"
+        agent.runtime.flag_verified = True
+        agent.runtime.same_path_fail_count = 2
+        agent.runtime.user_vuln_hint_rounds = 1
         agent.context.state.recon_dimension4_active = True
         agent.reset_context()
         assert agent.session_state.target is None
-        assert agent._blocked_targets == set()
-        assert agent._claimed_flag is None
-        assert agent._flag_verified is False
-        assert agent._same_path_fail_count == 0
-        assert agent._user_vuln_hint_rounds == 0
+        assert agent.runtime.blocked_targets == set()
+        assert agent.runtime.claimed_flag is None
+        assert agent.runtime.flag_verified is False
+        assert agent.runtime.same_path_fail_count == 0
+        assert agent.runtime.user_vuln_hint_rounds == 0
         assert agent.context.state.recon_dimension4_active is False
 
     def test_reset_runtime_state_for_recon_initializes_expected_fields(self):
@@ -509,22 +533,22 @@ class TestAgentCore:
             detected_phase=PentestPhase.RECON,
         )
 
-        assert agent._auto_skill_input == "对 example.com 做社工和信息收集，顺便找flag"
-        assert agent._is_recon_phase is True
-        assert agent._is_ctf_mode is True
-        assert agent._claimed_flag is None
-        assert agent._flag_verified is False
-        assert agent._flag_claim_count == 0
-        assert agent._post_flag_rounds == 0
-        assert agent._rounds_without_progress == 0
-        assert agent._python_timeout_rounds == 0
-        assert agent._blocked_targets == set()
-        assert agent._failed_targets == {}
-        assert agent._seen_step_signatures == set()
-        assert agent._current_attack_path is None
-        assert agent._same_path_fail_count == 0
-        assert agent._path_switch_forced is False
-        assert agent._consecutive_errors == 0
+        assert agent.runtime.auto_skill_input == "对 example.com 做社工和信息收集，顺便找flag"
+        assert agent.runtime.is_recon_phase is True
+        assert agent.runtime.is_ctf_mode is True
+        assert agent.runtime.claimed_flag is None
+        assert agent.runtime.flag_verified is False
+        assert agent.runtime.flag_claim_count == 0
+        assert agent.runtime.post_flag_rounds == 0
+        assert agent.runtime.rounds_without_progress == 0
+        assert agent.runtime.python_timeout_rounds == 0
+        assert agent.runtime.blocked_targets == set()
+        assert agent.runtime.failed_targets == {}
+        assert agent.runtime.seen_step_signatures == set()
+        assert agent.runtime.current_attack_path is None
+        assert agent.runtime.same_path_fail_count == 0
+        assert agent.runtime.path_switch_forced is False
+        assert agent.runtime.consecutive_errors == 0
         assert agent.context.state.recon_dimension4_active is True
         assert agent.context.state.recon_dimensions_completed == {
             "server": False,
@@ -535,25 +559,25 @@ class TestAgentCore:
 
     def test_agent_init_sets_runtime_defaults(self):
         agent = self._make_agent()
-        assert agent._auto_skill_input == ""
-        assert agent._user_vuln_hint == ""
-        assert agent._user_vuln_hint_rounds == 0
-        assert agent._claimed_flag is None
-        assert agent._flag_verified is False
-        assert agent._flag_claim_count == 0
-        assert agent._post_flag_rounds == 0
-        assert agent._is_recon_phase is False
-        assert agent._rounds_without_progress == 0
-        assert agent._python_timeout_rounds == 0
-        assert agent._seen_step_signatures == set()
-        assert agent._current_attack_path is None
-        assert agent._same_path_fail_count == 0
-        assert agent._path_switch_forced is False
-        assert agent._failed_targets == {}
-        assert agent._blocked_targets == set()
-        assert agent._unverified_assumptions == []
-        assert agent._is_ctf_mode is False
-        assert agent._consecutive_errors == 0
+        assert agent.runtime.auto_skill_input == ""
+        assert agent.runtime.user_vuln_hint == ""
+        assert agent.runtime.user_vuln_hint_rounds == 0
+        assert agent.runtime.claimed_flag is None
+        assert agent.runtime.flag_verified is False
+        assert agent.runtime.flag_claim_count == 0
+        assert agent.runtime.post_flag_rounds == 0
+        assert agent.runtime.is_recon_phase is False
+        assert agent.runtime.rounds_without_progress == 0
+        assert agent.runtime.python_timeout_rounds == 0
+        assert agent.runtime.seen_step_signatures == set()
+        assert agent.runtime.current_attack_path is None
+        assert agent.runtime.same_path_fail_count == 0
+        assert agent.runtime.path_switch_forced is False
+        assert agent.runtime.failed_targets == {}
+        assert agent.runtime.blocked_targets == set()
+        assert agent.runtime.unverified_assumptions == []
+        assert agent.runtime.is_ctf_mode is False
+        assert agent.runtime.consecutive_errors == 0
 
     def test_build_round_context_consumes_user_vuln_hint_rounds(self):
         from vulnclaw.agent.context import PentestPhase
@@ -568,31 +592,31 @@ class TestAgentCore:
         round1 = agent._build_round_context(1, 5)
         assert "用户明确提示" in round1
         assert "第 1/3 轮" in round1
-        assert agent._user_vuln_hint_rounds == 2
+        assert agent.runtime.user_vuln_hint_rounds == 2
 
         round2 = agent._build_round_context(2, 5)
         assert "第 2/2 轮" in round2
-        assert agent._user_vuln_hint_rounds == 1
+        assert agent.runtime.user_vuln_hint_rounds == 1
 
     def test_reset_runtime_state_clears_previous_run_contamination(self):
         from vulnclaw.agent.context import PentestPhase
 
         agent = self._make_agent()
-        agent._blocked_targets = {"old.example.com"}
+        agent.runtime.blocked_targets = {"old.example.com"}
 
-        agent._failed_targets = {"old.example.com": 3}
-        agent._claimed_flag = "flag{old}"
-        agent._flag_verified = True
-        agent._flag_claim_count = 7
-        agent._post_flag_rounds = 2
-        agent._rounds_without_progress = 5
-        agent._python_timeout_rounds = 4
-        agent._current_attack_path = "regex_bypass"
-        agent._same_path_fail_count = 3
-        agent._path_switch_forced = True
-        agent._consecutive_errors = 2
-        agent._user_vuln_hint = "old hint"
-        agent._user_vuln_hint_rounds = 9
+        agent.runtime.failed_targets = {"old.example.com": 3}
+        agent.runtime.claimed_flag = "flag{old}"
+        agent.runtime.flag_verified = True
+        agent.runtime.flag_claim_count = 7
+        agent.runtime.post_flag_rounds = 2
+        agent.runtime.rounds_without_progress = 5
+        agent.runtime.python_timeout_rounds = 4
+        agent.runtime.current_attack_path = "regex_bypass"
+        agent.runtime.same_path_fail_count = 3
+        agent.runtime.path_switch_forced = True
+        agent.runtime.consecutive_errors = 2
+        agent.runtime.user_vuln_hint = "old hint"
+        agent.runtime.user_vuln_hint_rounds = 9
         agent.context.state.recon_dimension4_active = True
         agent.context.state.recon_dimensions_completed = {
             "server": True,
@@ -606,22 +630,22 @@ class TestAgentCore:
             detected_phase=PentestPhase.VULN_DISCOVERY,
         )
 
-        assert agent._is_recon_phase is False
-        assert agent._is_ctf_mode is False
-        assert agent._blocked_targets == set()
-        assert agent._failed_targets == {}
-        assert agent._claimed_flag is None
-        assert agent._flag_verified is False
-        assert agent._flag_claim_count == 0
-        assert agent._post_flag_rounds == 0
-        assert agent._rounds_without_progress == 0
-        assert agent._python_timeout_rounds == 0
-        assert agent._current_attack_path is None
-        assert agent._same_path_fail_count == 0
-        assert agent._path_switch_forced is False
-        assert agent._consecutive_errors == 0
-        assert agent._user_vuln_hint
-        assert agent._user_vuln_hint_rounds == 3
+        assert agent.runtime.is_recon_phase is False
+        assert agent.runtime.is_ctf_mode is False
+        assert agent.runtime.blocked_targets == set()
+        assert agent.runtime.failed_targets == {}
+        assert agent.runtime.claimed_flag is None
+        assert agent.runtime.flag_verified is False
+        assert agent.runtime.flag_claim_count == 0
+        assert agent.runtime.post_flag_rounds == 0
+        assert agent.runtime.rounds_without_progress == 0
+        assert agent.runtime.python_timeout_rounds == 0
+        assert agent.runtime.current_attack_path is None
+        assert agent.runtime.same_path_fail_count == 0
+        assert agent.runtime.path_switch_forced is False
+        assert agent.runtime.consecutive_errors == 0
+        assert agent.runtime.user_vuln_hint
+        assert agent.runtime.user_vuln_hint_rounds == 3
         assert agent.context.state.recon_dimension4_active is False
         assert agent.context.state.recon_dimensions_completed == {
             "server": False,
@@ -643,13 +667,73 @@ class TestAgentCoreLoop:
         return AgentCore(config=config)
 
     @pytest.mark.asyncio
-    async def test_auto_pentest_stops_on_done_signal(self):
-        agent = self._make_agent()
+    async def test_llm_client_call_llm_auto_uses_shared_helper(self, monkeypatch):
+        from vulnclaw.agent import llm_client
 
-        async def _fake_call_llm_auto(system_prompt, round_context):
+        class DummyLoop:
+            async def run_in_executor(self, executor, fn):
+                class Msg:
+                    content = "hello"
+                    tool_calls = None
+
+                class Choice:
+                    message = Msg()
+
+                class Resp:
+                    choices = [Choice()]
+
+                return Resp()
+
+        class DummyAgent:
+            class _DummyClient:
+                class _Chat:
+                    class _Completions:
+                        def create(self, **kwargs):
+                            raise AssertionError("executor stub should be used")
+
+                    completions = _Completions()
+
+                chat = _Chat()
+
+            class _DummyConfig:
+                class _DummyLLM:
+                    model = "gpt-4o-mini"
+                    max_tokens = 256
+                    temperature = 0.1
+                    provider = "openai"
+                    reasoning_effort = "high"
+
+                llm = _DummyLLM()
+
+            class _DummyContext:
+                @staticmethod
+                def get_messages():
+                    return []
+
+            config = _DummyConfig()
+            context = _DummyContext()
+
+            def _build_openai_tools(self):
+                return []
+
+            def _get_client(self):
+                return self._DummyClient()
+
+        dummy = DummyAgent()
+        monkeypatch.setattr(llm_client, "extract_response", lambda message: "ok")
+        monkeypatch.setattr(llm_client.asyncio, "get_event_loop", lambda: DummyLoop())
+        result = await llm_client.call_llm_auto(dummy, "sys", "round")
+        assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_auto_pentest_stops_on_done_signal(self, monkeypatch):
+        agent = self._make_agent()
+        from vulnclaw.agent import loop_controller
+
+        async def _fake_call_llm_auto(agent_obj, system_prompt, round_context):
             return "本轮未发现新漏洞，准备总结。\n[DONE]"
 
-        agent._call_llm_auto = _fake_call_llm_auto
+        monkeypatch.setattr(loop_controller, "call_llm_auto", _fake_call_llm_auto)
         # Use input that skips recon (so RECON_MIN_ROUNDS doesn't block [DONE])
         results = await agent.auto_pentest("扫描 example.com 的 SQL注入漏洞", max_rounds=5)
 
@@ -657,8 +741,9 @@ class TestAgentCoreLoop:
         assert results[0].should_continue is False
 
     @pytest.mark.asyncio
-    async def test_auto_pentest_ctf_flag_state_machine(self):
+    async def test_auto_pentest_ctf_flag_state_machine(self, monkeypatch):
         agent = self._make_agent()
+        from vulnclaw.agent import loop_controller
         round_responses = [
             "发现可疑文件，尝试读取。\nflag{test123}",
             "验证 flag{test123} 正确，flag 获取成功！",
@@ -666,55 +751,57 @@ class TestAgentCoreLoop:
         ]
         call_idx = 0
 
-        async def _fake_call_llm_auto(system_prompt, round_context):
+        async def _fake_call_llm_auto(agent_obj, system_prompt, round_context):
             nonlocal call_idx
             text = round_responses[call_idx]
             call_idx += 1
             return text
 
-        agent._call_llm_auto = _fake_call_llm_auto
+        monkeypatch.setattr(loop_controller, "call_llm_auto", _fake_call_llm_auto)
         results = await agent.auto_pentest("NSSCTF 解题找 flag", max_rounds=10)
 
         # Should claim flag on round 1
-        assert agent._claimed_flag == "flag{test123}"
+        assert agent.runtime.claimed_flag == "flag{test123}"
         # Should verify on round 2 (verification markers in response)
-        assert agent._flag_verified is True
+        assert agent.runtime.flag_verified is True
         # Post-flag safety exit should limit extra rounds
         assert len(results) <= 4
         assert results[-1].should_continue is False
 
     @pytest.mark.asyncio
-    async def test_auto_pentest_dead_loop_detects_same_path(self):
+    async def test_auto_pentest_dead_loop_detects_same_path(self, monkeypatch):
         agent = self._make_agent()
+        from vulnclaw.agent import loop_controller
 
-        async def _fake_call_llm_auto(system_prompt, round_context):
+        async def _fake_call_llm_auto(agent_obj, system_prompt, round_context):
             # Same wording every round, with an attack-path keyword
             return "尝试 sql注入测试，使用 UNION SELECT，未成功。"
 
-        agent._call_llm_auto = _fake_call_llm_auto
+        monkeypatch.setattr(loop_controller, "call_llm_auto", _fake_call_llm_auto)
         results = await agent.auto_pentest("扫描 example.com 的 SQL注入漏洞", max_rounds=5)
 
         # Same path repeated without progress → counter increases
-        assert agent._same_path_fail_count >= 3
-        assert agent._rounds_without_progress >= 3
+        assert agent.runtime.same_path_fail_count >= 3
+        assert agent.runtime.rounds_without_progress >= 3
         # Should still stop at max_rounds (no [DONE])
         assert len(results) == 5
 
     @pytest.mark.asyncio
-    async def test_auto_pentest_blocks_repeatedly_failed_target(self):
+    async def test_auto_pentest_blocks_repeatedly_failed_target(self, monkeypatch):
         agent = self._make_agent()
+        from vulnclaw.agent import loop_controller
 
-        async def _fake_call_llm_auto(system_prompt, round_context):
+        async def _fake_call_llm_auto(agent_obj, system_prompt, round_context):
             return "访问 https://victim.local/admin 访问失败，连接超时。"
 
-        agent._call_llm_auto = _fake_call_llm_auto
+        monkeypatch.setattr(loop_controller, "call_llm_auto", _fake_call_llm_auto)
         results = await agent.auto_pentest("测试 victim.local", max_rounds=5)
 
         # victim.local should be tracked as failed
-        assert "victim.local" in agent._failed_targets
-        assert agent._failed_targets["victim.local"] >= 3
+        assert "victim.local" in agent.runtime.failed_targets
+        assert agent.runtime.failed_targets["victim.local"] >= 3
         # After 3 failures it should be blocked
-        assert "victim.local" in agent._blocked_targets
+        assert "victim.local" in agent.runtime.blocked_targets
 
 
     @pytest.mark.asyncio

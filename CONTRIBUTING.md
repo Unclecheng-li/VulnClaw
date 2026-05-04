@@ -20,7 +20,14 @@ VulnClaw/
 │   │   ├── llm_client.py         # LLM 调用与响应提取
 │   │   ├── tool_call_manager.py  # tool-call 去重、执行编排、参数容错
 │   │   ├── loop_controller.py    # auto_pentest / persistent_pentest 主循环
-│   │   └── recon_tracker.py      # recon 维度关键词与完成度追踪
+│   │   ├── recon_tracker.py      # recon 维度关键词与完成度追踪
+│   │   ├── prompt_context.py     # round context / attack summary 组装
+│   │   ├── anti_loop.py          # 阶段切换、完成信号、失败目标、攻击路径判定
+│   │   ├── ctf_mode.py           # flag claim / verify / post-flag 状态机
+│   │   ├── system_prompt.py      # dynamic system prompt 拼装
+│   │   ├── input_analysis.py     # 用户输入解析、目标/阶段/漏洞提示提取
+│   │   ├── skill_context.py      # Skill 上下文选择
+│   │   └── kb_context.py         # KB prompt context 构建
 │   │
 │   ├── cli/              # Typer CLI 入口、doctor、REPL
 │   ├── config/           # 配置模型、配置加载、环境变量覆盖
@@ -87,6 +94,7 @@ VulnClaw/
 ## Contribution Tips
 
 - 尽量在正确模块里改代码，不要把已经拆出去的职责重新塞回 `core.py`。
+- `core.py` 现在的目标是保持为“协调壳层”，新增逻辑优先放进对应 helper/module。
 - 改行为逻辑时，优先补或更新 `tests/` 中对应测试。
 - 版本号统一以 `pyproject.toml` 为主，同时检查 README / fallback 版本展示。
 - 如果修改文档中的能力描述，确保它和实际实现一致，尤其是 MCP、沙箱、安全边界这类容易误导的部分。

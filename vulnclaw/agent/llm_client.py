@@ -5,6 +5,11 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from vulnclaw.agent.tool_call_manager import (
+    handle_tool_calls,
+    handle_tool_calls_with_results,
+)
+
 
 def extract_response(message: Any) -> str:
     """Extract the actual response text from an LLM message.
@@ -53,7 +58,7 @@ async def call_llm(agent: Any, system_prompt: str) -> str:
 
     choice = response.choices[0]
     if choice.message.tool_calls:
-        return await agent._handle_tool_calls(choice.message)
+        return await handle_tool_calls(agent, choice.message)
     return extract_response(choice.message)
 
 
@@ -99,7 +104,7 @@ async def call_llm_auto(agent: Any, system_prompt: str, round_context: str) -> s
 
     choice = response.choices[0]
     if choice.message.tool_calls:
-        tool_results, skipped_info = await agent._handle_tool_calls_with_results(choice.message)
+        tool_results, skipped_info = await handle_tool_calls_with_results(agent, choice.message)
 
         executed_tcs = []
         for tc in tool_results:

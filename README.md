@@ -8,7 +8,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI_Compatible-green)](https://platform.openai.com/)
 [![MCP](https://img.shields.io/badge/Toolchain-MCP-orange)](https://modelcontextprotocol.io/)
-[![PyPI](https://img.shields.io/badge/PyPI-v0.2.5-blueviolet)](https://pypi.org/project/vulnclaw/)
+[![PyPI](https://img.shields.io/badge/PyPI-v0.2.6-blueviolet)](https://pypi.org/project/vulnclaw/)
 [![Security](https://img.shields.io/badge/Scope-Authorized_Only-red)](#-安全声明)
 <br>
 
@@ -358,9 +358,13 @@ vulnclaw config provider minimax   # 一键切换
 | 模块           | 文件                                             | 说明                                          |
 | -------------- | ------------------------------------------------ | --------------------------------------------- |
 | **CLI 入口**   | `cli/main.py`                                    | Typer REPL + 9 个子命令（含 persistent）       |
-| **Agent 核心** | `agent/core.py`                                  | AgentCore 协调入口（主循环、LLM、工具与 recon 逻辑已逐步拆分到独立模块） |
+| **Agent 核心** | `agent/core.py`                                  | AgentCore 协调入口（核心重构后主要保留少量协调职责） |
 | **动态提示词** | `agent/prompts.py`                               | 基础身份 + 核心契约 + Skill + MCP 工具列表    |
+| **Prompt 组装** | `agent/system_prompt.py` + `prompt_context.py`  | system prompt / round context / attack summary 组装 |
+| **输入分析**   | `agent/input_analysis.py`                        | 目标识别、阶段识别、用户漏洞提示提取          |
+| **反死循环 / CTF** | `agent/anti_loop.py` + `ctf_mode.py`        | 完成信号、攻击路径、失败目标、flag 状态机      |
 | **会话状态**   | `agent/context.py`                               | 阶段追踪 + 漏洞发现 + 步骤记录                |
+| **Skill / KB 上下文** | `agent/skill_context.py` + `kb_context.py` | Skill 选择与知识库 prompt 注入                |
 | **MCP 编排**   | `mcp/registry.py` + `lifecycle.py` + `router.py` | 服务注册 + 生命周期 + 自然语言→工具路由       |
 | **Skill 调度** | `skills/loader.py` + `dispatcher.py`             | 目录格式 Skill + 16 种意图动态调度            |
 | **编解码工具** | `skills/crypto_tools.py`                         | 29 种编解码/加解密操作，注册为内置 Agent 工具  |
@@ -500,7 +504,7 @@ vulnclaw config set session.show_thinking false # 隐藏推理过程（也可在
 | v0.1.2   | 3 个 CTF 专项 Skill + 3 个现有 Skill 更新 + 触发词扩展 | ✅ 已完成  |
 | v0.1.3   | 四维信息收集模型 + RECON_MIN_ROUNDS + 维度完成度自检 + 社工条件触发 + osint-recon Skill | ✅ 已完成 |
 | v0.1.4   | 渗透问题诊断修复（findings 解析 / 信息收集推进 / 摘要过滤 / nmap 安全阀） | ✅ 已完成 |
-| **v0.2.5** | **当前 PyPI 版本：移动端能力入口补齐、持续性渗透、内置工具增强与文档校准** | ✅ **当前** |
+| **v0.2.6** | **当前版本：核心编排层模块化收口、doctor/KB/report 配置闭环与架构文档同步** | ✅ **当前** |
 | v0.3     | 逆向能力（IDA Pro）— Skill 已就绪                       | 📋 Skill ✅ |
 | v0.4     | 知识库增强（ChromaDB 向量检索 + 语义 Skill 调度）       | 📋         |
 | v1.0     | 正式发布（PyPI + 文档 + CI/CD）                         | 📋         |

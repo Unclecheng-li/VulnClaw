@@ -167,6 +167,7 @@ def generate_report(
     session: SessionState,
     output_path: Optional[str] = None,
     llm_attack_summary: str = "",  # ★ LLM 生成的攻击路径摘要
+    report_format: str = "markdown",
 ) -> Path:
     """Generate a penetration test report from session state.
 
@@ -252,7 +253,14 @@ def generate_report(
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(report_content, encoding="utf-8")
+    if report_format.lower() == "html":
+        html_content = Template(
+            """<!doctype html><html><head><meta charset="utf-8"><title>VulnClaw Report</title></head><body><pre>{{ content }}</pre></body></html>"""
+        ).render(content=report_content)
+        output = output.with_suffix(".html") if output.suffix.lower() != ".html" else output
+        output.write_text(html_content, encoding="utf-8")
+    else:
+        output.write_text(report_content, encoding="utf-8")
 
     # Also generate PoC scripts
     from vulnclaw.report.poc_builder import generate_pocs

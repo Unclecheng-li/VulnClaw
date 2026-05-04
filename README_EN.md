@@ -8,7 +8,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![OpenAI Compatible](https://img.shields.io/badge/API-OpenAI_Compatible-green)](https://platform.openai.com/)
 [![MCP](https://img.shields.io/badge/Toolchain-MCP-orange)](https://modelcontextprotocol.io/)
-[![PyPI](https://img.shields.io/badge/PyPI-v0.2.5-blueviolet)](https://pypi.org/project/vulnclaw/)
+[![PyPI](https://img.shields.io/badge/PyPI-v0.2.6-blueviolet)](https://pypi.org/project/vulnclaw/)
 [![Security](https://img.shields.io/badge/Scope-Authorized_Only-red)](#-security-notice)
 <br>
 
@@ -358,9 +358,13 @@ vulnclaw config provider minimax   # one-command switch
 | Module              | File                                                  | Description                                        |
 | ------------------- | ----------------------------------------------------- | -------------------------------------------------- |
 | **CLI Entry**       | `cli/main.py`                                        | Typer REPL + 9 subcommands (incl. persistent)      |
-| **Agent Core**      | `agent/core.py`                                      | AgentCore coordination entrypoint (main loops, LLM, tool orchestration, and recon logic are being split into focused modules) |
+| **Agent Core**      | `agent/core.py`                                      | AgentCore coordination entrypoint (after the refactor it mainly keeps thin coordination responsibilities) |
 | **Dynamic Prompts** | `agent/prompts.py`                                   | Base identity + core contract + skills + MCP tools  |
+| **Prompt Assembly** | `agent/system_prompt.py` + `prompt_context.py`       | System prompt / round context / attack summary assembly |
+| **Input Analysis**  | `agent/input_analysis.py`                            | Target detection, phase detection, explicit vuln-hint extraction |
+| **Anti-loop / CTF** | `agent/anti_loop.py` + `ctf_mode.py`                | Completion signals, attack-path heuristics, failed-target tracking, flag state machine |
 | **Session State**   | `agent/context.py`                                   | Phase tracking + findings + step records            |
+| **Skill / KB Context** | `agent/skill_context.py` + `kb_context.py`       | Skill selection and knowledge-base prompt injection |
 | **MCP Orchestration**| `mcp/registry.py` + `lifecycle.py` + `router.py`    | Service registry + lifecycle + NL→tool routing     |
 | **Skill Dispatcher** | `skills/loader.py` + `dispatcher.py`               | Directory-format Skills + 16-intent dynamic routing |
 | **Crypto Tools**    | `skills/crypto_tools.py`                             | 29 encode/decode/crypto ops, registered as built-in tools |
@@ -500,7 +504,7 @@ Config file location: `~/.vulnclaw/config.yaml`.
 | v0.1.2    | 3 CTF specialized Skills + 3 existing Skills updated + trigger words       | ✅ Done      |
 | v0.1.3    | Four-dimension recon model + RECON_MIN_ROUNDS + dimension completion self-check + social eng conditional trigger + osint-recon Skill | ✅ Done |
 | v0.1.4    | Pentest stability fixes (findings parsing / recon progression / summary filtering / nmap guardrails) | ✅ Done |
-| **v0.2.5**| **Current PyPI release: mobile entrypoints, persistent pentest, stronger built-in tools, and docs alignment** | ✅ **Current** |
+| **v0.2.6**| **Current release: core orchestration modularization, doctor/KB/report-config closure, and architecture docs sync** | ✅ **Current** |
 | v0.3      | Reverse engineering (IDA Pro) — Skills ready                              | 📋 Skills ✅ |
 | v0.4      | Knowledge base enhancement (ChromaDB vector retrieval + semantic skill routing)| 📋          |
 | v1.0      | Official release (PyPI + docs + CI/CD)                                    | 📋          |

@@ -41,3 +41,8 @@ htmlcov/
 *.bak
 _test_output*.txt
 _test_report_raw.txt
+
+# Local docs / local-only artifacts
+.test-tmp/
+VulnClaw_项目分析与优化报告.md
+VulnClaw测试报告.md

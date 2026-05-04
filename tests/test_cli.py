@@ -37,6 +37,8 @@ class TestCLI:
         result = runner.invoke(app, ["doctor"])
         # Should not crash
         assert result.exit_code == 0
+        assert "Registered:" in result.output
+        assert "Tools:" in result.output
 
     def test_cli_config_list(self, runner):
         from vulnclaw.cli.main import app
@@ -55,6 +57,16 @@ class TestCLI:
         result = runner.invoke(app, ["config", "provider", "deepseek"])
         # Should not crash
         assert result.exit_code == 0
+
+    def test_cli_kb_update(self, runner, monkeypatch, tmp_path):
+        from vulnclaw.cli.main import app
+        import vulnclaw.kb.store as kb_store
+
+        monkeypatch.setattr(kb_store, "KB_DIR", tmp_path)
+        result = runner.invoke(app, ["kb", "update"])
+        assert result.exit_code == 0
+        assert "知识库更新完成" in result.output
+        assert (tmp_path / "index.json").exists()
 
     def test_cli_kb_info(self, runner):
         from vulnclaw.cli.main import app

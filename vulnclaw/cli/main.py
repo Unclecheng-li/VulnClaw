@@ -232,7 +232,10 @@ def _run_repl() -> None:
                     if agent.session_state.findings:
                         try:
                             from vulnclaw.report.generator import generate_report
-                            final_report = generate_report(agent.session_state)
+                            final_report = generate_report(
+                                agent.session_state,
+                                report_format=config.session.report_format,
+                            )
                             console.print(f"[+] 最终报告: {final_report}")
                         except Exception:
                             pass
@@ -449,7 +452,11 @@ def run(
     # Auto-generate report
     if output:
         from vulnclaw.report.generator import generate_report
-        generate_report(agent.session_state, output)
+        generate_report(
+            agent.session_state,
+            output,
+            report_format=config.session.report_format,
+        )
         console.print(f"[+] 报告已保存: {output}")
 
     mcp_manager.stop_all()
@@ -547,7 +554,10 @@ def persistent(
         if agent.session_state.findings:
             try:
                 from vulnclaw.report.generator import generate_report
-                final_report = generate_report(agent.session_state)
+                final_report = generate_report(
+                    agent.session_state,
+                    report_format=config.session.report_format,
+                )
                 console.print(f"[+] 中断时最终报告已保存: {final_report}")
             except Exception as e:
                 console.print(f"[!] 中断时报告生成失败: {e}")
@@ -782,6 +792,7 @@ def init() -> None:
 def doctor() -> None:
     """🏥 检查 VulnClaw 运行环境."""
     import shutil
+    from vulnclaw.mcp.lifecycle import MCPLifecycleManager
 
     console.print("[bold]🦞 VulnClaw 环境检查[/]")
     console.print()
@@ -828,16 +839,27 @@ def doctor() -> None:
     # Check MCP servers
     console.print()
     console.print("[bold]MCP 服务[/]:")
+    mcp_manager = MCPLifecycleManager(config)
+    started = mcp_manager.start_enabled_servers()
+    registry_servers = mcp_manager.registry.get_all_servers()
+    tool_schemas = mcp_manager.get_tool_schemas()
+
+    console.print(f"  Registered: [bold]{started}[/] 个服务")
+    console.print(f"  Tools: [bold]{len(tool_schemas)}[/] 个已暴露")
+
     for name, srv in config.mcp.servers.items():
         status = "[green]已启用[/]" if srv.enabled else "[dim]未启用[/]"
         priority_label = {0: "P0", 1: "P1", 2: "P2"}.get(srv.priority, "??")
-        mode = "local" if name in {"fetch", "memory"} else "placeholder"
-        console.print(f"  {name}: {status} [{priority_label}] mode={mode}")
+        state = registry_servers.get(name)
+        mode = state.execution_mode if state else "unknown"
+        running = "[green]运行中[/]" if state and state.running else "[yellow]已注册[/]" if state else "[red]未注册[/]"
+        tool_count = len(state.tools) if state else 0
+        console.print(f"  {name}: {status} [{priority_label}] {running} mode={mode} tools={tool_count}")
 
 
-    console.print("[dim]说明：当前 doctor 只检查配置启用状态；部分 MCP 服务仍为预览/占位实现，启用不代表已完成真实协议接入。[/]")
+    console.print("[dim]说明：doctor 现在会读取 MCP 注册态与工具暴露情况；fetch/memory 为 local，其余多数服务仍为 placeholder。[/]")
     console.print("[yellow]⚠️ python_execute 为高风险实验性能力：当前仅做基础模式拦截，不是强隔离沙箱；仅建议在授权靶场或本地可控环境中开启。[/]")
-    console.print("[dim]知识库命令已预留，但当前仍以基础维护为主，检索增强尚未完整接入主流程。[/]")
+    console.print("[dim]知识库命令已接入真实更新流程，后续检索增强仍可继续收口。[/]")
 
     console.print()
     if has_key:
@@ -856,8 +878,21 @@ app.add_typer(kb_app, name="kb")
 def kb_update() -> None:
     """更新安全知识库."""
     console.print("[*] 正在更新知识库...")
-    # TODO: implement KB update logic
-    console.print("[+] 知识库已更新")
+    from vulnclaw.kb.store import KnowledgeStore
+    from vulnclaw.kb.updater import seed_knowledge_base
+
+    store = KnowledgeStore()
+    before_stats = store.get_stats()
+    seed_knowledge_base(store)
+    after_stats = store.get_stats()
+
+    before_total = sum(before_stats.values())
+    after_total = sum(after_stats.values())
+    delta = after_total - before_total
+    category_summary = ", ".join(f"{cat}={count}" for cat, count in sorted(after_stats.items()))
+
+    console.print(f"[+] 知识库更新完成: +{delta} 条记录")
+    console.print(f"    分类统计: {category_summary or '空'}")
 
 
 # ── Default command (no sub-command → REPL) ────────────────────────
@@ -954,7 +989,6 @@ def main(ctx: typer.Context) -> None:
 
 def _auto_save_recon_report(agent, user_input: str, config) -> None:
     """Auto-save a recon report after auto_pentest completes when user requested file output."""
-    import os
     import re
     from datetime import datetime
 
@@ -968,54 +1002,16 @@ def _auto_save_recon_report(agent, user_input: str, config) -> None:
         if path_match:
             output_path = path_match.group(1)
         else:
-            # Default: Desktop
-            desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
             safe_name = re.sub(r'[^\w]', '_', target)[:30]
             date_str = datetime.now().strftime('%Y%m%d_%H%M')
-            output_path = os.path.join(desktop, f'{safe_name}_侦察报告_{date_str}.md')
+            output_path = str(config.session.output_dir / f"{safe_name}_recon_{date_str}.md")
 
-        # Build report content from session state
-        lines = [f"# 🦞 {target} 侦察报告\n"]
-        lines.append(f"> 生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
-        lines.append(f"> 工具：VulnClaw v0.1.0\n\n---\n")
-
-        # Target info
-        lines.append("## 1. 目标概览\n")
-        lines.append(f"- **目标**：{target}\n")
-        lines.append(f"- **总轮数**：{len(state.executed_steps)}\n")
-        lines.append(f"- **发现漏洞**：{len(state.findings)}\n\n")
-
-        # Findings
-        if state.findings:
-            lines.append("## 2. 发现漏洞\n")
-            for i, f in enumerate(state.findings, 1):
-                lines.append(f"### {i}. [{f.severity}] {f.title}\n")
-                lines.append(f"- **证据**：{f.evidence[:300]}\n")
-                if f.remediation:
-                    lines.append(f"- **修复建议**：{f.remediation}\n")
-                lines.append("")
-
-        # Executed steps
-        if state.executed_steps:
-            lines.append("## 3. 执行步骤\n")
-            for i, step in enumerate(state.executed_steps, 1):
-                step_text = step if isinstance(step, str) else str(step)
-                lines.append(f"{i}. {step_text[:200]}\n")
-            lines.append("")
-
-        # Notes (key observations)
-        if state.notes:
-            lines.append("## 4. 关键观察\n")
-            for note in state.notes:
-                lines.append(f"- {note[:300]}\n")
-            lines.append("")
-
-        lines.append("---\n*本报告由 VulnClaw 自动生成*\n")
-
-        # Write to file
-        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.writelines(lines)
+        from vulnclaw.report.generator import generate_report
+        generate_report(
+            state,
+            output_path,
+            report_format=config.session.report_format,
+        )
 
         console.print(f"\n[+] 侦察报告已保存: {output_path}")
 
